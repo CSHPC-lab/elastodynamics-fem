@@ -1,3 +1,9 @@
+/*実行コマンド
+cd /data3/kusumoto/elastodynamics-fem/
+g++ main.cpp vtk_reader.cpp
+./a.out
+*/
+
 #include "vtk_reader.hpp"
 #include <iostream>
 #include <cmath>
@@ -962,10 +968,3 @@ void write_vtk_displacement(
 
     fclose(fp);
 }
-
-/*実行コマンド
-ssh lynx10
-cd /data3/kusumoto/elastodynamics-fem/
-g++ main.cpp vtk_reader.cpp
-./a.out
-*/

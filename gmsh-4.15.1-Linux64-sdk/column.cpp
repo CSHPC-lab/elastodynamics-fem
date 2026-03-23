@@ -43,9 +43,6 @@ int main(int argc, char **argv)
 
 /*実行コマンド
 g++ -Iinclude column.cpp -Llib -lgmsh
-export LD_LIBRARY_PATH=.../lib:$LD_LIBRARY_PATH
-または
-export LD_LIBRARY_PATH=/home/apple/elastodynamics-fem/gmsh-4.15.1-Linux64-sdk/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 ./a.out
-python3 gmsh2fistr.py column.msh
 */
