@@ -95,8 +95,8 @@ int main()
 {
     char filepath[256] = "column.vtk";
     double duration = 20.0;
-    int num_steps = 2000;
-    int sample_freq = 10; // nステップごとにVTK出力
+    int num_steps = 200;
+    int sample_freq = 1; // nステップごとにVTK出力
     double c1 = 200.0;
     double c2 = 100.0;
     double rho = 2000.0;
@@ -180,7 +180,7 @@ int main()
     build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
 
     // タイムステップループ
-    for (int step = 0; step < num_steps; step++)
+    for (int step = 1; step <= num_steps; step++)
     {
         double t = step * dt;
         double bc_val[3] = {0.0, sin(t), 0.0};
@@ -202,7 +202,7 @@ int main()
         for (int i = 0; i < num_nodes * 3; i++)
         {
             double u_new = u_tmp[i];
-            double u_old = u[step][i];
+            double u_old = u[step - 1][i];
             double v_old = v_tmp[i];
             double a_old = a_tmp[i];
 
@@ -216,7 +216,7 @@ int main()
         // 解xを変位uに保存
         for (int i = 0; i < num_nodes * 3; i++)
         {
-            u[step + 1][i] = u_tmp[i];
+            u[step][i] = u_tmp[i];
         }
     }
 

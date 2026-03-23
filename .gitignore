@@ -1,2 +1,5 @@
 *.out
 *.vtk
+*.msh
+*.cnt
+*.dat

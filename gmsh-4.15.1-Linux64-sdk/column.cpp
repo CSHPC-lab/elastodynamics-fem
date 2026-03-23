@@ -19,7 +19,7 @@ int main(int argc, char **argv)
     //                       ↑dim=0(点)  ↑dim=3, tag=1(ボリューム)
 
     // メッシュサイズの設定（値を小さくすると要素が細かくなる）
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 5.0);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 1.0);
 
     // 3Dメッシュ生成（四面体がデフォルト）
     gmsh::model::mesh::generate(3);
@@ -33,6 +33,10 @@ int main(int argc, char **argv)
     // 保存
     gmsh::write("column.vtk");
 
+    // FrontISTR変換用に .msh (v2.2 ASCII) も出力
+    gmsh::option::setNumber("Mesh.MshFileVersion", 2.2);
+    gmsh::write("column.msh");
+
     gmsh::finalize();
     return 0;
 }
@@ -43,4 +47,5 @@ export LD_LIBRARY_PATH=.../lib:$LD_LIBRARY_PATH
 または
 export LD_LIBRARY_PATH=/home/apple/elastodynamics-fem/gmsh-4.15.1-Linux64-sdk/lib:$LD_LIBRARY_PATH
 ./a.out
+python3 gmsh2fistr.py column.msh
 */
