@@ -8,7 +8,15 @@ int main(int argc, char **argv)
     // 10x10x100m の直方体を作成（OpenCASCADE kernel を使用）
     // addBox(x, y, z, dx, dy, dz)
     gmsh::model::occ::addBox(0, 0, 0, 10, 10, 100);
+
+    // 例：(5, 5, 50) に節点を固定したい
+    int pt = gmsh::model::occ::addPoint(5, 5, 50);
+
     gmsh::model::occ::synchronize();
+
+    // この点をボリューム 1 に埋め込む
+    gmsh::model::mesh::embed(0, {pt}, 3, 1);
+    //                       ↑dim=0(点)  ↑dim=3, tag=1(ボリューム)
 
     // メッシュサイズの設定（値を小さくすると要素が細かくなる）
     gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 5.0);

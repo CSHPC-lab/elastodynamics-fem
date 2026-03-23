@@ -4,6 +4,250 @@
 #include <ctime>
 #include <sys/stat.h>
 
+void calculate_dN(double dN[3][10], double r, double s, double t);
+void gauss_integrate(double dN0[3][10], double dN1[3][10], double dN2[3][10], double dN3[3][10]);
+double inverse_3_3_mat(double mat[3][3], double inv_mat[3][3]);
+void construct_mat(
+    double *node_coords,
+    int *ele_nodes,
+    int num_elements,
+    double dN0[3][10],
+    double dN1[3][10],
+    double dN2[3][10],
+    double dN3[3][10],
+    double lambda,
+    double mu,
+    double rho,
+    double dt,
+    double (*kmat_coo_val)[3][3],
+    double *mmat_coo_val,
+    int *coo_row,
+    int *coo_col);
+int sort_and_merge_bcoo(
+    int nnz_coo,
+    int num_nodes,
+    int *coo_row,
+    int *coo_col,
+    double (*kmat_coo_val)[3][3],
+    double *mmat_coo_val);
+void build_bcrs(
+    int *coo_row,
+    int *coo_col,
+    double (*kmat_coo_val)[3][3],
+    double *mmat_coo_val,
+    int nnz_bcoo,
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double (*bcrs_kval)[3][3],
+    double *bcrs_mval);
+void extract_bc_correction(
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double (*bcrs_kval)[3][3],
+    int *bc_flag,
+    double (*bc_corr)[3]);
+void apply_bc_to_lhs(
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double (*bcrs_kval)[3][3],
+    int *bc_flag);
+void apply_bc_to_rhs(
+    int num_nodes,
+    int *bc_flag,
+    double *bc_val,
+    double (*bc_corr)[3],
+    double *rhs);
+void build_block_jacobi(
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double (*bcrs_kval)[3][3],
+    double (*inv_diag)[3][3]);
+void bcrs_spmv_m(
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double *bcrs_mval,
+    double *x,
+    double *y);
+int pcg_solve(
+    int num_nodes,
+    int *bcrs_row_ptr,
+    int *bcrs_col_ind,
+    double (*bcrs_kval)[3][3],
+    double (*inv_diag)[3][3],
+    double *rhs,
+    double *x,
+    double tol,
+    int max_iter);
+void write_vtk_displacement(
+    const char *filename,
+    double *node_coords,
+    int num_nodes,
+    int *ele_nodes,
+    int num_elements,
+    double *displacement);
+
+int main()
+{
+    char filepath[256] = "column.vtk";
+    double duration = 20.0;
+    int num_steps = 2000;
+    int sample_freq = 10; // nステップごとにVTK出力
+    double c1 = 200.0;
+    double c2 = 100.0;
+    double rho = 2000.0;
+    double lambda = rho * (c1 * c1 - 2 * c2 * c2);
+    double mu = rho * c2 * c2;
+    double dt = duration / num_steps;
+
+    FEMMesh mesh = read_vtk(filepath);
+    print_mesh_info(mesh);
+
+    double *node_coords = mesh.coords_ptr();
+    int num_nodes = mesh.num_nodes;
+    int *ele_nodes = mesh.tet_ptr();
+    int num_elements = mesh.num_tets;
+    double dN0[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
+    double dN1[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
+    double dN2[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
+    double dN3[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
+    double (*kmat_coo_val)[3][3] = new double[100 * num_elements][3][3](); // 要素剛性行列の配列
+    double *mmat_coo_val = new double[100 * num_elements]();               // 要素質量行列の配列
+    int *coo_row = new int[100 * num_elements]();                          // 要素行列の行インデックスの配列
+    int *coo_col = new int[100 * num_elements]();                          // 要素行列の列インデックスの配列
+
+    gauss_integrate(dN0, dN1, dN2, dN3);
+
+    construct_mat(node_coords,
+                  ele_nodes,
+                  num_elements,
+                  dN0,
+                  dN1,
+                  dN2,
+                  dN3,
+                  lambda,
+                  mu,
+                  rho,
+                  dt,
+                  kmat_coo_val,
+                  mmat_coo_val,
+                  coo_row,
+                  coo_col);
+
+    int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes, coo_row, coo_col, kmat_coo_val, mmat_coo_val);
+
+    double (*bcrs_kval)[3][3] = new double[nnz_bcrs][3][3];
+    double *bcrs_mval = new double[nnz_bcrs];
+    int *bcrs_row_ptr = new int[num_nodes + 1];
+    int *bcrs_col_ind = new int[nnz_bcrs];
+
+    build_bcrs(coo_row, coo_col, kmat_coo_val, mmat_coo_val, nnz_bcrs, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bcrs_mval);
+
+    delete[] coo_row;
+    delete[] coo_col;
+    delete[] kmat_coo_val;
+    delete[] mmat_coo_val;
+
+    std::cout << "Number of non-zero blocks in bcrs: " << nnz_bcrs << std::endl;
+
+    int *bc_flag = new int[num_nodes]();
+    double (*bc_corr)[3] = new double[num_nodes * 3][3];
+    double (*inv_diag)[3][3] = new double[num_nodes][3][3];
+    double **u = new double *[num_steps + 1]; // 変位の記録
+    for (int i = 0; i < num_steps + 1; i++)
+        u[i] = new double[num_nodes * 3]();
+    double *u_tmp = new double[num_nodes * 3](); // タイムステップごとの変位の一時保存用
+    double *v_tmp = new double[num_nodes * 3](); // タイムステップごとの速度の一時保存用
+    double *a_tmp = new double[num_nodes * 3](); // タイムステップごとの加速度の一時保存用
+    double *rhs = new double[num_nodes * 3]();
+    double *tmp = new double[num_nodes * 3]();
+
+    // 境界条件
+    for (int i = 0; i < num_nodes; i++)
+    {
+        if (node_coords[i * 3 + 2] < 1e-6)
+            bc_flag[i] = 1;
+    }
+
+    extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag, bc_corr);
+
+    apply_bc_to_lhs(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag);
+
+    build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
+
+    // タイムステップループ
+    for (int step = 0; step < num_steps; step++)
+    {
+        double t = step * dt;
+        double bc_val[3] = {0.0, sin(t), 0.0};
+
+        // ここでrhsを構築（外力の寄与なども加える）
+        for (int i = 0; i < num_nodes * 3; i++)
+        {
+            // Newmark-β法の右辺の構築
+            tmp[i] = u_tmp[i] * 4.0 / dt / dt + v_tmp[i] * 4.0 / dt + a_tmp[i];
+        }
+        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与
+
+        apply_bc_to_rhs(num_nodes, bc_flag, bc_val, bc_corr, rhs);
+
+        int iter = pcg_solve(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3);
+        std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
+
+        // 速度と加速度の更新（Newmark-β法）
+        for (int i = 0; i < num_nodes * 3; i++)
+        {
+            double u_new = u_tmp[i];
+            double u_old = u[step][i];
+            double v_old = v_tmp[i];
+            double a_old = a_tmp[i];
+
+            double a_new = (u_new - u_old) * 4.0 / dt / dt - v_old * 4.0 / dt - a_old;
+            double v_new = v_old + (a_new + a_old) * dt / 2.0;
+
+            v_tmp[i] = v_new;
+            a_tmp[i] = a_new;
+        }
+
+        // 解xを変位uに保存
+        for (int i = 0; i < num_nodes * 3; i++)
+        {
+            u[step + 1][i] = u_tmp[i];
+        }
+    }
+
+    // --- VTK出力前にディレクトリ作成 ---
+    // タイムスタンプ生成
+    time_t now = time(nullptr);
+    struct tm *lt = localtime(&now);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", lt);
+
+    // results/20260323_143025/ のようなパスを作成
+    char output_dir[256];
+    sprintf(output_dir, "results/%s", timestamp);
+
+    mkdir("results", 0755);  // 親ディレクトリ
+    mkdir(output_dir, 0755); // タイムスタンプディレクトリ
+
+    // 各ステップのVTKを出力
+    for (int step = 0; step <= num_steps; step += sample_freq)
+    {
+        char filename[512];
+        sprintf(filename, "%s/result_%04d.vtk", output_dir, step);
+        write_vtk_displacement(filename, node_coords, num_nodes,
+                               ele_nodes, num_elements, u[step]);
+    }
+
+    printf("Output: %s/\n", output_dir);
+
+    return 0;
+}
+
 void calculate_dN(double dN[3][10], double r, double s, double t)
 {
     // 形状関数の微分 dN をガウス点で計算する
@@ -717,162 +961,6 @@ void write_vtk_displacement(
     }
 
     fclose(fp);
-}
-
-int main()
-{
-    char filepath[256] = "column.vtk";
-    double duration = 20.0;
-    int num_steps = 2;
-    double c1 = 200.0;
-    double c2 = 100.0;
-    double rho = 2000.0;
-    double lambda = rho * (c1 * c1 - 2 * c2 * c2);
-    double mu = rho * c2 * c2;
-    double dt = duration / num_steps;
-
-    FEMMesh mesh = read_vtk(filepath);
-    print_mesh_info(mesh);
-
-    double *node_coords = mesh.coords_ptr();
-    int num_nodes = mesh.num_nodes;
-    int *ele_nodes = mesh.tet_ptr();
-    int num_elements = mesh.num_tets;
-    double dN0[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
-    double dN1[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
-    double dN2[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
-    double dN3[3][10] = {0.0};                                             // ガウス点での形状関数の微分の配列
-    double (*kmat_coo_val)[3][3] = new double[100 * num_elements][3][3](); // 要素剛性行列の配列
-    double *mmat_coo_val = new double[100 * num_elements]();               // 要素質量行列の配列
-    int *coo_row = new int[100 * num_elements]();                          // 要素行列の行インデックスの配列
-    int *coo_col = new int[100 * num_elements]();                          // 要素行列の列インデックスの配列
-
-    gauss_integrate(dN0, dN1, dN2, dN3);
-
-    construct_mat(node_coords,
-                  ele_nodes,
-                  num_elements,
-                  dN0,
-                  dN1,
-                  dN2,
-                  dN3,
-                  lambda,
-                  mu,
-                  rho,
-                  dt,
-                  kmat_coo_val,
-                  mmat_coo_val,
-                  coo_row,
-                  coo_col);
-
-    int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes, coo_row, coo_col, kmat_coo_val, mmat_coo_val);
-
-    double (*bcrs_kval)[3][3] = new double[nnz_bcrs][3][3];
-    double *bcrs_mval = new double[nnz_bcrs];
-    int *bcrs_row_ptr = new int[num_nodes + 1];
-    int *bcrs_col_ind = new int[nnz_bcrs];
-
-    build_bcrs(coo_row, coo_col, kmat_coo_val, mmat_coo_val, nnz_bcrs, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bcrs_mval);
-
-    delete[] coo_row;
-    delete[] coo_col;
-    delete[] kmat_coo_val;
-    delete[] mmat_coo_val;
-
-    std::cout << "Number of non-zero blocks in bcrs: " << nnz_bcrs << std::endl;
-
-    int *bc_flag = new int[num_nodes]();
-    double (*bc_corr)[3] = new double[num_nodes * 3][3];
-    double (*inv_diag)[3][3] = new double[num_nodes][3][3];
-    double **u = new double *[num_steps + 1]; // 変位の記録
-    for (int i = 0; i < num_steps + 1; i++)
-        u[i] = new double[num_nodes * 3]();
-    double *u_tmp = new double[num_nodes * 3](); // タイムステップごとの変位の一時保存用
-    double *v_tmp = new double[num_nodes * 3](); // タイムステップごとの速度の一時保存用
-    double *a_tmp = new double[num_nodes * 3](); // タイムステップごとの加速度の一時保存用
-    double *rhs = new double[num_nodes * 3]();
-    double *tmp = new double[num_nodes * 3]();
-
-    // 境界条件
-    for (int i = 0; i < num_nodes; i++)
-    {
-        if (node_coords[i * 3 + 2] < 1e-6)
-            bc_flag[i] = 1;
-    }
-
-    extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag, bc_corr);
-
-    apply_bc_to_lhs(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag);
-
-    build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
-
-    // タイムステップループ
-    for (int step = 0; step < num_steps; step++)
-    {
-        double t = step * dt;
-        double bc_val[3] = {0.0, sin(t), 0.0};
-
-        // ここでrhsを構築（外力の寄与なども加える）
-        for (int i = 0; i < num_nodes * 3; i++)
-        {
-            // Newmark-β法の右辺の構築
-            tmp[i] = u_tmp[i] * 4.0 / dt / dt + v_tmp[i] * 4.0 / dt + a_tmp[i];
-        }
-        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与
-
-        apply_bc_to_rhs(num_nodes, bc_flag, bc_val, bc_corr, rhs);
-
-        int iter = pcg_solve(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3);
-        std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
-
-        // 速度と加速度の更新（Newmark-β法）
-        for (int i = 0; i < num_nodes * 3; i++)
-        {
-            double u_new = u_tmp[i];
-            double u_old = u[step][i];
-            double v_old = v_tmp[i];
-            double a_old = a_tmp[i];
-
-            double a_new = (u_new - u_old) * 4.0 / dt / dt - v_old * 4.0 / dt - a_old;
-            double v_new = v_old + (a_new + a_old) * dt / 2.0;
-
-            v_tmp[i] = v_new;
-            a_tmp[i] = a_new;
-        }
-
-        // 解xを変位uに保存
-        for (int i = 0; i < num_nodes * 3; i++)
-        {
-            u[step + 1][i] = u_tmp[i];
-        }
-    }
-
-    // --- VTK出力前にディレクトリ作成 ---
-    // タイムスタンプ生成
-    time_t now = time(nullptr);
-    struct tm *lt = localtime(&now);
-    char timestamp[64];
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", lt);
-
-    // results/20260323_143025/ のようなパスを作成
-    char output_dir[256];
-    sprintf(output_dir, "results/%s", timestamp);
-
-    mkdir("results", 0755);  // 親ディレクトリ
-    mkdir(output_dir, 0755); // タイムスタンプディレクトリ
-
-    // 各ステップのVTKを出力
-    for (int step = 0; step <= num_steps; step++)
-    {
-        char filename[512];
-        sprintf(filename, "%s/result_%04d.vtk", output_dir, step);
-        write_vtk_displacement(filename, node_coords, num_nodes,
-                               ele_nodes, num_elements, u[step]);
-    }
-
-    printf("Output: %s/\n", output_dir);
-
-    return 0;
 }
 
 /*実行コマンド
