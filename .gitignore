@@ -3,3 +3,5 @@
 *.msh
 *.cnt
 *.dat
+*.log
+*/results/*
