@@ -4,4 +4,4 @@
 *.cnt
 *.dat
 *.log
-*/results/*
+results/*

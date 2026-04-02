@@ -95,17 +95,27 @@ void write_vtk_displacement(
     int num_nodes,
     int *ele_nodes,
     int num_elements,
-    double *displacement);
+    double *displacement,
+    double total_time);
+void write_node_disp_csv(
+    const char *filename,
+    int target_node,
+    double **u,
+    int num_steps,
+    int sample_freq,
+    double dt);
 
 int main()
 {
     char filepath[256] = "column.vtk";
     double duration = 20.0;
-    int num_steps = 200;
+    int num_steps = 2000;
     int sample_freq = 1; // nステップごとにVTK出力
     double c1 = 200.0;
     double c2 = 100.0;
     double rho = 2000.0;
+    int target_node = 8;
+
     double lambda = rho * (c1 * c1 - 2 * c2 * c2);
     double mu = rho * c2 * c2;
     double dt = duration / num_steps;
@@ -163,12 +173,13 @@ int main()
     int *bc_flag = new int[num_nodes]();
     double (*bc_corr)[3] = new double[num_nodes * 3][3];
     double (*inv_diag)[3][3] = new double[num_nodes][3][3];
-    double **u = new double *[num_steps + 1]; // 変位の記録
-    for (int i = 0; i < num_steps + 1; i++)
+    double **u = new double *[num_steps / sample_freq + 1]; // 変位の記録
+    for (int i = 0; i < num_steps / sample_freq + 1; i++)
         u[i] = new double[num_nodes * 3]();
     double *u_tmp = new double[num_nodes * 3](); // タイムステップごとの変位の一時保存用
     double *v_tmp = new double[num_nodes * 3](); // タイムステップごとの速度の一時保存用
     double *a_tmp = new double[num_nodes * 3](); // タイムステップごとの加速度の一時保存用
+    double *u_prv = new double[num_nodes * 3](); // タイムステップごとの過去の変位の一時保存用
     double *rhs = new double[num_nodes * 3]();
     double *tmp = new double[num_nodes * 3]();
 
@@ -208,25 +219,29 @@ int main()
         for (int i = 0; i < num_nodes * 3; i++)
         {
             double u_new = u_tmp[i];
-            double u_old = u[step - 1][i];
+            double u_old = u_prv[i];
             double v_old = v_tmp[i];
             double a_old = a_tmp[i];
 
             double a_new = (u_new - u_old) * 4.0 / dt / dt - v_old * 4.0 / dt - a_old;
             double v_new = v_old + (a_new + a_old) * dt / 2.0;
 
+            u_prv[i] = u_new;
             v_tmp[i] = v_new;
             a_tmp[i] = a_new;
         }
 
         // 解xを変位uに保存
-        for (int i = 0; i < num_nodes * 3; i++)
+        if (step % sample_freq == 0)
         {
-            u[step][i] = u_tmp[i];
+            for (int i = 0; i < num_nodes * 3; i++)
+            {
+                u[step / sample_freq][i] = u_tmp[i];
+            }
         }
     }
 
-    // --- VTK出力前にディレクトリ作成 ---
+    // --- 出力前にディレクトリ作成 ---
     // タイムスタンプ生成
     time_t now = time(nullptr);
     struct tm *lt = localtime(&now);
@@ -241,15 +256,21 @@ int main()
     mkdir(output_dir, 0755); // タイムスタンプディレクトリ
 
     // 各ステップのVTKを出力
-    for (int step = 0; step <= num_steps; step += sample_freq)
-    {
-        char filename[512];
-        sprintf(filename, "%s/result_%04d.vtk", output_dir, step);
-        write_vtk_displacement(filename, node_coords, num_nodes,
-                               ele_nodes, num_elements, u[step]);
-    }
+    // for (int step = 0; step <= num_steps; step += sample_freq)
+    // {
+    //     char filename[512];
+    //     sprintf(filename, "%s/result_%04d.vtk", output_dir, step / sample_freq);
+    //     write_vtk_displacement(filename, node_coords, num_nodes,
+    //                            ele_nodes, num_elements, u[step / sample_freq],
+    //                            step * dt);
+    // }
+
+    char csv_filename[512];
+    sprintf(csv_filename, "%s/node%d_disp.csv", output_dir, target_node + 1);
+    write_node_disp_csv(csv_filename, target_node, u, num_steps, sample_freq, dt);
 
     printf("Output: %s/\n", output_dir);
+    printf("CSV: %s\n", csv_filename);
 
     return 0;
 }
@@ -914,7 +935,8 @@ void write_vtk_displacement(
     int num_nodes,
     int *ele_nodes,
     int num_elements,
-    double *displacement)
+    double *displacement,
+    double total_time)
 {
     // 1タイムステップ分のVTKファイルを出力
     FILE *fp = fopen(filename, "w");
@@ -926,6 +948,9 @@ void write_vtk_displacement(
     fprintf(fp, "DATASET UNSTRUCTURED_GRID\n");
 
     /* 節点座標 */
+    fprintf(fp, "\nFIELD FieldData 1\n");
+    fprintf(fp, "TOTALTIME 1 1 double\n");
+    fprintf(fp, "%.10e\n", total_time);
     fprintf(fp, "POINTS %d double\n", num_nodes);
     for (int i = 0; i < num_nodes; i++)
     {
@@ -957,7 +982,13 @@ void write_vtk_displacement(
 
     /* 変位データ */
     fprintf(fp, "POINT_DATA %d\n", num_nodes);
-    fprintf(fp, "VECTORS displacement double\n");
+    fprintf(fp, "SCALARS NODE_ID int 1\n");
+    fprintf(fp, "LOOKUP_TABLE default\n");
+    for (int i = 0; i < num_nodes; i++)
+    {
+        fprintf(fp, "%d\n", i + 1); // 1始まりのノードIDを出力
+    }
+    fprintf(fp, "VECTORS DISPLACEMENT double\n");
     for (int i = 0; i < num_nodes; i++)
     {
         fprintf(fp, "%.15e %.15e %.15e\n",
@@ -967,4 +998,27 @@ void write_vtk_displacement(
     }
 
     fclose(fp);
+}
+
+void write_node_disp_csv(
+    const char *filename,
+    int target_node,
+    double **u,
+    int num_steps,
+    int sample_freq,
+    double dt)
+{
+    FILE *csv_fp = fopen(filename, "w");
+    fprintf(csv_fp, "time,disp_x,disp_y,disp_z,disp_mag\n");
+    for (int step = 0; step <= num_steps; step += sample_freq)
+    {
+        double t = step * dt;
+        int idx = step / sample_freq;
+        double ux = u[idx][target_node * 3 + 0];
+        double uy = u[idx][target_node * 3 + 1];
+        double uz = u[idx][target_node * 3 + 2];
+        double mag = sqrt(ux * ux + uy * uy + uz * uz);
+        fprintf(csv_fp, "%.10e,%.10e,%.10e,%.10e,%.10e\n", t, ux, uy, uz, mag);
+    }
+    fclose(csv_fp);
 }

@@ -1,3 +1,8 @@
+/*実行コマンド
+g++ -Iinclude column.cpp -Llib -lgmsh
+export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
+./a.out
+*/
 #include <gmsh.h>
 
 int main(int argc, char **argv)
@@ -7,10 +12,10 @@ int main(int argc, char **argv)
 
     // 10x10x100m の直方体を作成（OpenCASCADE kernel を使用）
     // addBox(x, y, z, dx, dy, dz)
-    gmsh::model::occ::addBox(0, 0, 0, 10, 10, 100);
+    gmsh::model::occ::addBox(0, 0, 0, 1, 1, 10);
 
     // 例：(5, 5, 50) に節点を固定したい
-    int pt = gmsh::model::occ::addPoint(5, 5, 50);
+    int pt = gmsh::model::occ::addPoint(0.5, 0.5, 5);
 
     gmsh::model::occ::synchronize();
 
@@ -19,7 +24,7 @@ int main(int argc, char **argv)
     //                       ↑dim=0(点)  ↑dim=3, tag=1(ボリューム)
 
     // メッシュサイズの設定（値を小さくすると要素が細かくなる）
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 1.0);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 0.1);
 
     // 3Dメッシュ生成（四面体がデフォルト）
     gmsh::model::mesh::generate(3);
@@ -40,9 +45,3 @@ int main(int argc, char **argv)
     gmsh::finalize();
     return 0;
 }
-
-/*実行コマンド
-g++ -Iinclude column.cpp -Llib -lgmsh
-export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
-./a.out
-*/
