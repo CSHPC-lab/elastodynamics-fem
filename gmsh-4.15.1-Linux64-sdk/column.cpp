@@ -24,7 +24,7 @@ int main(int argc, char **argv)
     //                       ↑dim=0(点)  ↑dim=3, tag=1(ボリューム)
 
     // メッシュサイズの設定（値を小さくすると要素が細かくなる）
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 0.1);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 0.05);
 
     // 3Dメッシュ生成（四面体がデフォルト）
     gmsh::model::mesh::generate(3);
