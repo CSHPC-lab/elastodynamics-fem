@@ -1,6 +1,6 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
-g++ main.cpp vtk_reader.cpp
+g++ main_omp.cpp vtk_reader.cpp -fopenmp
 ./a.out
 */
 
@@ -123,6 +123,8 @@ int main()
     double mu = rho * c2 * c2;
     double dt = duration / num_steps;
 
+    printf("使用可能な最大スレッド数：%d\n", omp_get_max_threads());
+
     FEMMesh mesh = read_vtk(filepath);
     print_mesh_info(mesh);
 
@@ -187,6 +189,7 @@ int main()
     double *tmp = new double[num_nodes * 3]();
 
     // 境界条件
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         if (node_coords[i * 3 + 2] < 1e-6)
@@ -206,6 +209,7 @@ int main()
         double bc_val[3] = {0.0, sin(t), 0.0};
 
         // ここでrhsを構築（外力の寄与なども加える）
+#pragma omp parallel for
         for (int i = 0; i < num_nodes * 3; i++)
         {
             // Newmark-β法の右辺の構築
@@ -219,6 +223,7 @@ int main()
         std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
 
         // 速度と加速度の更新（Newmark-β法）
+#pragma omp parallel for
         for (int i = 0; i < num_nodes * 3; i++)
         {
             double u_new = u_tmp[i];
@@ -237,6 +242,7 @@ int main()
         // 解xを変位uに保存
         if (step % sample_freq == 0)
         {
+#pragma omp parallel for
             for (int i = 0; i < num_nodes * 3; i++)
             {
                 u[step / sample_freq][i] = u_tmp[i];
@@ -276,7 +282,8 @@ int main()
     printf("CSV: %s\n", csv_filename);
 
     double end_time = omp_get_wtime();
-    printf("Total simulation time: %.2f seconds\n", end_time - start_time);
+
+    printf("Total execution time: %.2f seconds\n", end_time - start_time);
 
     return 0;
 }
@@ -382,6 +389,7 @@ void construct_mat(
     // ele_nodes: [num_elements * 10] 連続配置: 要素0の10節点, 要素1の10節点,...
     // kmat_coo は [100 * num_elements][3][3] の配列で、各要素の行列を連続配置で格納
 
+#pragma omp parallel for
     for (int elem = 0; elem < num_elements; elem++)
     {
         int local_node_indices[10];    // 要素の10節点のインデックスを格納する配列
@@ -502,6 +510,7 @@ int sort_and_merge_bcoo(
     double *work_mval = new double[nnz_coo];
 
     int *pos = new int[num_nodes];
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         pos[i] = offset[i];
@@ -611,6 +620,7 @@ void build_bcrs(
 {
     // 並び替え済みCOOからbcrsを構築
     // col_ind, kval, mval をコピー
+#pragma omp parallel for
     for (int k = 0; k < nnz_bcrs; k++)
     {
         bcrs_col_ind[k] = coo_col[k];
@@ -621,6 +631,7 @@ void build_bcrs(
     }
 
     // row_ptr を構築
+#pragma omp parallel for
     for (int i = 0; i <= num_nodes; i++)
     {
         bcrs_row_ptr[i] = 0;
@@ -644,6 +655,7 @@ void bcrs_spmv(
     double *y)
 {
     // bcrs 行列ベクトル積: y = A * x
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
@@ -669,6 +681,7 @@ void bcrs_spmv_m(
     double *y)
 {
     // bcrs 行列ベクトル積: y = A * x
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
@@ -698,10 +711,12 @@ void extract_bc_correction(
     // 毎タイムステップの右辺ベクトル補正に使う。
     // bc_corr[num_nodes * 3][3]: bc_corr[i*3+a][b] = Σ_{j∈constrained} A_original[i][j][a][b]
     int ndof = num_nodes * 3;
+#pragma omp parallel for
     for (int i = 0; i < ndof; i++)
         for (int b = 0; b < 3; b++)
             bc_corr[i][b] = 0.0;
 
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         if (bc_flag[i])
@@ -729,6 +744,7 @@ void apply_bc_to_lhs(
 {
     // 境界条件を左辺行列に適用（1回だけ呼ぶ）
     // bc_flag[num_nodes]: 0=自由, 1=拘束（節点単位、3方向同時拘束）
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         for (int p = row_ptr[i]; p < row_ptr[i + 1]; p++)
@@ -763,12 +779,14 @@ void apply_bc_to_rhs(
     // bc_val[3]: 拘束変位値（全拘束節点で共通、例: {0, sin(t), 0}）
     // 自由節点の右辺を補正: rhs[i] -= Σ_b bc_corr[i][b] * bc_val[b]
     int ndof = num_nodes * 3;
+#pragma omp parallel for
     for (int i = 0; i < ndof; i++)
     {
         rhs[i] -= bc_corr[i][0] * bc_val[0] + bc_corr[i][1] * bc_val[1] + bc_corr[i][2] * bc_val[2];
     }
 
     // 拘束節点の右辺を拘束値に設定
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         if (bc_flag[i])
@@ -788,6 +806,7 @@ void build_block_jacobi(
     double (*inv_diag)[3][3])
 {
     // ブロックヤコビ前処理の構築（対角ブロックの逆行列を計算）
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         /* 対角ブロックを探す */
@@ -813,6 +832,7 @@ void apply_block_jacobi(
     double *z)
 {
     // ブロックヤコビ前処理の適用: z = M⁻¹ r
+#pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         double r0 = r[i * 3 + 0];
@@ -828,6 +848,7 @@ double dot(int n, double *a, double *b)
 {
     // ベクトル内積
     double s = 0.0;
+#pragma omp parallel for reduction(+ : s)
     for (int i = 0; i < n; i++)
     {
         s += a[i] * b[i];
@@ -857,6 +878,7 @@ int pcg_solve(
 
     // r = b - A*x
     bcrs_spmv(num_nodes, row_ptr, col_ind, kval, x, Ap);
+#pragma omp parallel for
     for (int i = 0; i < ndof; i++)
     {
         r[i] = b[i] - Ap[i];
@@ -866,6 +888,7 @@ int pcg_solve(
     apply_block_jacobi(num_nodes, inv_diag, r, z);
 
     // p = z
+#pragma omp parallel for
     for (int i = 0; i < ndof; i++)
     {
         p[i] = z[i];
@@ -897,6 +920,7 @@ int pcg_solve(
         double alpha = rz / pAp;
 
         // x += alpha * p, r -= alpha * Ap
+#pragma omp parallel for
         for (int i = 0; i < ndof; i++)
         {
             x[i] += alpha * p[i];
@@ -919,6 +943,7 @@ int pcg_solve(
         double beta = rz_new / rz;
 
         // p = z + beta * p
+#pragma omp parallel for
         for (int i = 0; i < ndof; i++)
         {
             p[i] = z[i] + beta * p[i];
