@@ -1,6 +1,6 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
-g++ main.cpp vtk_reader.cpp
+g++ main.cpp vtk_reader.cpp -fopenmp
 ./a.out
 */
 
