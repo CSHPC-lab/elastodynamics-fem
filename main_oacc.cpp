@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvc++ main_omp.cpp vtk_reader.cpp -fopenmp
+nvc++ main_oacc.cpp vtk_reader.cpp -fopenmp -acc -Minfo=accel
 ./a.out
 */
 
@@ -11,6 +11,7 @@ nvc++ main_omp.cpp vtk_reader.cpp -fopenmp
 #include <ctime>
 #include <sys/stat.h>
 #include <omp.h>
+#include <openacc.h>
 
 void calculate_dN(double dN[30], double r, double s, double t);
 void gauss_integrate(double dN0[30], double dN1[30], double dN2[30], double dN3[30]);
@@ -118,8 +119,8 @@ int main()
 
     char filepath[256] = "column.vtk";
     double duration = 0.005;
-    int num_steps = 500000 * 2;
-    int sample_freq = 500 * 2; // nステップごとにVTK出力
+    int num_steps = 500000 * 5;
+    int sample_freq = 500 * 5; // nステップごとにVTK出力
     double c1 = std::sqrt(4000.0 * 0.7 / 1.3 / 0.4 * 1.0e9);
     double c2 = std::sqrt(4000.0 / 2.0 / 1.3 * 1.0e9);
     double rho = 1.0e-9;
@@ -135,6 +136,10 @@ int main()
     double dt = duration / num_steps;
 
     printf("使用可能な最大スレッド数：%d\n", omp_get_max_threads());
+    printf("使用可能な最大GPU数：%d\n", acc_get_num_devices(acc_device_nvidia));
+
+    acc_set_device_num(0, acc_device_nvidia); // GPU 0 を使用
+    acc_init(acc_device_nvidia);
 
     FEMMesh mesh = read_vtk(filepath);
     print_mesh_info(mesh);
@@ -153,9 +158,6 @@ int main()
     int *coo_col = new int[100 * num_elements]();                // 要素行列の列インデックスの配列
 
     gauss_integrate(dN0, dN1, dN2, dN3);
-
-#pragma acc enter data copyin(node_coords[0 : num_nodes * 3], ele_nodes[0 : num_elements * 10], dN0, dN1, dN2, dN3) \
-    create(kmat_coo_val[0 : 100 * num_elements * 9], mmat_coo_val[0 : 100 * num_elements], coo_row[0 : 100 * num_elements], coo_col[0 : 100 * num_elements])
 
     construct_mat(node_coords,
                   ele_nodes,
@@ -206,13 +208,14 @@ int main()
     double *p = new double[num_nodes * 3]();
     double *Ap = new double[num_nodes * 3]();
 
-    // 境界条件
+// 境界条件
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
         if (node_coords[i * 3] < 1e-6)
             bc_flag[i] = 1;
     }
+    double bc_val[3] = {0.0, 0.0, 0.0};
 
     extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag, bc_corr);
 
@@ -220,21 +223,31 @@ int main()
 
     build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
 
+    double data_transfer_start = omp_get_wtime();
+#pragma acc enter data copyin(tmp[0 : num_nodes * 3], u_tmp[0 : num_nodes * 3], v_tmp[0 : num_nodes * 3], a_tmp[0 : num_nodes * 3], bcrs_row_ptr[0 : num_nodes + 1],        \
+                              bcrs_col_ind[0 : nnz_bcrs], bcrs_kval[0 : nnz_bcrs * 9], bcrs_mval[0 : nnz_bcrs], rhs[0 : num_nodes * 3], bc_flag[0 : num_nodes],             \
+                              bc_val[0 : 3], bc_corr[0 : num_nodes * 3 * 3], inv_diag[0 : num_nodes * 9], r[0 : num_nodes * 3], z[0 : num_nodes * 3], p[0 : num_nodes * 3], \
+                              Ap[0 : num_nodes * 3], u_prv[0 : num_nodes * 3], u[0 : (num_steps / sample_freq + 1) * num_nodes * 3])
+    double data_transfer_end = omp_get_wtime();
+    printf("Data transfer to GPU time: %.2f seconds\n", data_transfer_end - data_transfer_start);
+
     // タイムステップループ
     for (int step = 1; step <= num_steps; step++)
     {
         double t = step * dt;
-        double bc_val[3] = {0.0, 0.0, 0.0};
 
         // ここでrhsを構築（外力の寄与なども加える）
-#pragma omp parallel for
+#pragma acc parallel loop present(tmp, u_tmp, v_tmp, a_tmp)
         for (int i = 0; i < num_nodes * 3; i++)
         {
             // Newmark-β法の右辺の構築
             tmp[i] = u_tmp[i] * 4.0 / dt / dt + v_tmp[i] * 4.0 / dt + a_tmp[i];
         }
         bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与
-        rhs[force_node * 3 + force_dof] += force_magnitude;                      // 外力の寄与
+#pragma acc serial present(rhs)
+        {
+            rhs[force_node * 3 + force_dof] += force_magnitude; // 外力の寄与
+        }
 
         apply_bc_to_rhs(num_nodes, bc_flag, bc_val, bc_corr, rhs);
 
@@ -242,7 +255,7 @@ int main()
         std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
 
         // 速度と加速度の更新（Newmark-β法）
-#pragma omp parallel for
+#pragma acc parallel loop present(u_tmp, u_prv, v_tmp, a_tmp)
         for (int i = 0; i < num_nodes * 3; i++)
         {
             double u_new = u_tmp[i];
@@ -261,13 +274,18 @@ int main()
         // 解xを変位uに保存
         if (step % sample_freq == 0)
         {
-#pragma omp parallel for
+#pragma acc parallel loop present(u, u_tmp)
             for (int i = 0; i < num_nodes * 3; i++)
             {
                 u[(step / sample_freq) * num_nodes * 3 + i] = u_tmp[i];
             }
         }
     }
+
+    data_transfer_start = omp_get_wtime();
+#pragma acc update host(u[0 : (num_steps / sample_freq + 1) * num_nodes * 3]) // GPUからホストに変位データを転送
+    data_transfer_end = omp_get_wtime();
+    printf("Data transfer from GPU time: %.2f seconds\n", data_transfer_end - data_transfer_start);
 
     // --- 出力前にディレクトリ作成 ---
     // タイムスタンプ生成
@@ -666,10 +684,11 @@ void bcrs_spmv_m(
     double *y)
 {
     // bcrs 行列ベクトル積: y = A * x
-#pragma omp parallel for
+#pragma acc parallel loop present(row_ptr, col_ind, val, x, y)
     for (int i = 0; i < num_nodes; i++)
     {
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
         for (int p = row_ptr[i]; p < row_ptr[i + 1]; p++)
         {
             int j = col_ind[p];
@@ -761,14 +780,14 @@ void apply_bc_to_rhs(
     // bc_val[3]: 拘束変位値（全拘束節点で共通、例: {0, sin(t), 0}）
     // 自由節点の右辺を補正: rhs[i] -= Σ_b bc_corr[i][b] * bc_val[b]
     int ndof = num_nodes * 3;
-#pragma omp parallel for
+#pragma acc parallel loop present(bc_val, bc_corr, rhs)
     for (int i = 0; i < ndof; i++)
     {
         rhs[i] -= bc_corr[3 * i + 0] * bc_val[0] + bc_corr[3 * i + 1] * bc_val[1] + bc_corr[3 * i + 2] * bc_val[2];
     }
 
     // 拘束節点の右辺を拘束値に設定
-#pragma omp parallel for
+#pragma acc parallel loop present(bc_flag, bc_val, rhs)
     for (int i = 0; i < num_nodes; i++)
     {
         if (bc_flag[i])
@@ -843,11 +862,12 @@ int pcg_solve(
     double b_norm = 0.0;
     double r_norm = 0.0;
 
-#pragma omp parallel for reduction(+ : rz, b_norm, r_norm)
+#pragma acc parallel loop reduction(+ : rz, b_norm, r_norm) present(row_ptr, col_ind, kval, inv_diag, b, x, r, z, p, Ap)
     for (int i = 0; i < num_nodes; i++)
     {
         // r = b - A*x
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
         for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
         {
             int j = col_ind[p_];
@@ -906,11 +926,12 @@ int pcg_solve(
     for (iter = 0; iter < max_iter; iter++)
     {
         double pAp = 0.0;
-#pragma omp parallel for reduction(+ : pAp)
+#pragma acc parallel loop reduction(+ : pAp) present(row_ptr, col_ind, kval, p, Ap)
         for (int i = 0; i < num_nodes; i++)
         {
             // Ap = A * p
             double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
             for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
             {
                 int j = col_ind[p_];
@@ -930,7 +951,7 @@ int pcg_solve(
         double alpha = rz / pAp;
 
         r_norm = 0.0;
-#pragma omp parallel for reduction(+ : r_norm)
+#pragma acc parallel loop reduction(+ : r_norm) present(x, p, r, Ap)
         for (int i = 0; i < ndof; i++)
         {
             // x += alpha * p, r -= alpha * Ap
@@ -950,7 +971,7 @@ int pcg_solve(
         }
 
         double rz_new = 0.0;
-#pragma omp parallel for reduction(+ : rz_new)
+#pragma acc parallel loop reduction(+ : rz_new) present(r, z, inv_diag)
         for (int i = 0; i < num_nodes; i++)
         {
             // z = M⁻¹r
@@ -972,7 +993,7 @@ int pcg_solve(
         double beta = rz_new / rz;
 
         // p = z + beta * p
-#pragma omp parallel for
+#pragma acc parallel loop present(p, z)
         for (int i = 0; i < ndof; i++)
         {
             p[i] = z[i] + beta * p[i];

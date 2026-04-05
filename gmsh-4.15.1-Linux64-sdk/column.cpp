@@ -26,10 +26,8 @@ int main(int argc, char **argv)
     // fragment 演算の後に synchronize を実行
     gmsh::model::occ::synchronize();
 
-    // 削除: gmsh::model::mesh::embed(0, {pt}, 3, 1); は不要になります
-
     // メッシュサイズの設定
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 0.4);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 0.1);
 
     // より高品質な3Dメッシュを求める場合は、HXTアルゴリズム(10)やFrontal(4)の指定が有効です（任意）
     // gmsh::option::setNumber("Mesh.Algorithm3D", 10);
