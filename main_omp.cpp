@@ -243,19 +243,50 @@ int main()
 
         // 速度と加速度の更新（Newmark-β法）
 #pragma omp parallel for
-        for (int i = 0; i < num_nodes * 3; i++)
+        for (int i = 0; i < num_nodes; i++)
         {
-            double u_new = u_tmp[i];
-            double u_old = u_prv[i];
-            double v_old = v_tmp[i];
-            double a_old = a_tmp[i];
+            double u_new_0 = u_tmp[i * 3 + 0];
+            double u_new_1 = u_tmp[i * 3 + 1];
+            double u_new_2 = u_tmp[i * 3 + 2];
+            double u_old_0 = u_prv[i * 3 + 0];
+            double u_old_1 = u_prv[i * 3 + 1];
+            double u_old_2 = u_prv[i * 3 + 2];
+            double v_old_0 = v_tmp[i * 3 + 0];
+            double v_old_1 = v_tmp[i * 3 + 1];
+            double v_old_2 = v_tmp[i * 3 + 2];
+            double a_old_0 = a_tmp[i * 3 + 0];
+            double a_old_1 = a_tmp[i * 3 + 1];
+            double a_old_2 = a_tmp[i * 3 + 2];
 
-            double a_new = (u_new - u_old) * 4.0 / dt / dt - v_old * 4.0 / dt - a_old;
-            double v_new = v_old + (a_new + a_old) * dt / 2.0;
+            double a_new_0 = (u_new_0 - u_old_0) * 4.0 / dt / dt - v_old_0 * 4.0 / dt - a_old_0;
+            double a_new_1 = (u_new_1 - u_old_1) * 4.0 / dt / dt - v_old_1 * 4.0 / dt - a_old_1;
+            double a_new_2 = (u_new_2 - u_old_2) * 4.0 / dt / dt - v_old_2 * 4.0 / dt - a_old_2;
+            double v_new_0 = v_old_0 + (a_new_0 + a_old_0) * dt / 2.0;
+            double v_new_1 = v_old_1 + (a_new_1 + a_old_1) * dt / 2.0;
+            double v_new_2 = v_old_2 + (a_new_2 + a_old_2) * dt / 2.0;
 
-            u_prv[i] = u_new;
-            v_tmp[i] = v_new;
-            a_tmp[i] = a_new;
+            if (bc_flag[i])
+            {
+                u_new_0 = bc_val[0];
+                u_new_1 = bc_val[1];
+                u_new_2 = bc_val[2];
+                v_new_0 = 0.0;
+                v_new_1 = 0.0;
+                v_new_2 = 0.0;
+                a_new_0 = 0.0;
+                a_new_1 = 0.0;
+                a_new_2 = 0.0;
+            }
+
+            u_prv[i * 3 + 0] = u_new_0;
+            u_prv[i * 3 + 1] = u_new_1;
+            u_prv[i * 3 + 2] = u_new_2;
+            v_tmp[i * 3 + 0] = v_new_0;
+            v_tmp[i * 3 + 1] = v_new_1;
+            v_tmp[i * 3 + 2] = v_new_2;
+            a_tmp[i * 3 + 0] = a_new_0;
+            a_tmp[i * 3 + 1] = a_new_1;
+            a_tmp[i * 3 + 2] = a_new_2;
         }
 
         // 解xを変位uに保存
