@@ -1,9 +1,8 @@
 *.out
 *.vtk
 *.msh
-*.cnt
-*.dat
 *.log
 results/*
-*/work/*
 cpp_log/*
+dyna_*
+*.stats
