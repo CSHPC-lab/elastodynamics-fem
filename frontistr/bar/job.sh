@@ -4,7 +4,7 @@
 #PJM -L node=4
 #PJM --mpi proc=16
 #PJM --omp thread=12
-#PJM -L elapse=01:00:00
+#PJM -L elapse=08:00:00
 #PJM -j
 #PJM -o ./logs/%j.out
 #PJM -e ./logs/%j.err
