@@ -27,16 +27,17 @@ python3 convert_gmsh_to_fistr.py
 
 import sys
 import os
+from math import sin
 
 
 # ---------------------------------------------------------------------------
 # Material / amplitude parameters
 # ---------------------------------------------------------------------------
-YOUNG      = 4000.0
-POISSON    = 0.3
-DENSITY    = 1.0e-9
-AMP_DT     = 2.5e-6   # amplitude table time step [s]
-AMP_END    = 5.0e-3   # amplitude table end time [s]
+YOUNG      = 16000000.0 / 3.0
+POISSON    = 2.0 / 3.0
+DENSITY    = 2000.0
+AMP_DT     = 0.000625   # amplitude table time step [s]
+AMP_END    = 20.0   # amplitude table end time [s]
 
 
 # ---------------------------------------------------------------------------
@@ -204,16 +205,17 @@ def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
         for nid in fix_nodes:
             f.write(f'{nid},\n')
 
-        # --- CL1 node group (centroid of free-end face) ---
-        f.write('!NGROUP, NGRP=CL1\n')
-        f.write(f'{cl1_node},\n')
+        # # --- CL1 node group (centroid of free-end face) ---
+        # f.write('!NGROUP, NGRP=CL1\n')
+        # f.write(f'{cl1_node},\n')
 
-        # # --- amplitude (constant 1.0 step load) ---
-        # f.write('!AMPLITUDE, NAME=AMP1\n')
-        # n_steps = round(AMP_END / AMP_DT)
-        # for i in range(n_steps + 1):
-        #     t = i * AMP_DT
-        #     f.write(f'1.00000E+00\t,\t{fmt_amp_time(t)}\n')
+        # --- amplitude (sin(t) load) ---
+        f.write('!AMPLITUDE, NAME=AMP1\n')
+        n_steps = round(AMP_END / AMP_DT)
+        for i in range(n_steps + 1):
+            t = i * AMP_DT
+            wave = sin(t)
+            f.write(f'{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n')
 
         f.write('!END\n')
 
@@ -238,11 +240,11 @@ def main():
     print(f'  tet10 elements : {len(tet10_elems)}')
     print(f'  tri6 by geom   : { {k: len(v) for k, v in sorted(tri6_by_geomtag.items())} }')
 
-    # --- FIX group: all nodes on x=0 face (geom_tag = 1) ---
-    if 1 not in tri6_by_geomtag:
-        sys.exit('ERROR: no tri6 elements with geom_tag=1 found (expected x=0 face)')
-    fix_nodes = face_nodes(tri6_by_geomtag[1])
-    print(f'  FIX group      : {len(fix_nodes)} nodes (geom_tag=1)')
+    # --- FIX group: all nodes on z=0 face (geom_tag = 5) ---
+    if 5 not in tri6_by_geomtag:
+        sys.exit('ERROR: no tri6 elements with geom_tag=5 found (expected z=0 face)')
+    fix_nodes = face_nodes(tri6_by_geomtag[5])
+    print(f'  FIX group      : {len(fix_nodes)} nodes (geom_tag=5)')
 
     # --- CL1: centroid node of x=10 face (geom_tag = 2) ---
     if 2 not in tri6_by_geomtag:
