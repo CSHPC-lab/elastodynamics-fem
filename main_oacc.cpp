@@ -6,6 +6,7 @@ nvc++ main_oacc.cpp vtk_reader.cpp -fopenmp -acc -Minfo=accel
 */
 
 #include "vtk_reader.hpp"
+#include "config.hpp"
 #include <iostream>
 #include <cmath>
 #include <ctime>
@@ -117,17 +118,19 @@ int main()
 {
     double start_time = omp_get_wtime();
 
-    char filepath[256] = "column.vtk";
-    double duration = 0.005;
-    int num_steps = 500000 * 1;
-    int sample_freq = 500 * 1; // nステップごとにVTK出力
-    double c1 = std::sqrt(4000.0 * 0.7 / 1.3 / 0.4 * 1.0e9);
-    double c2 = std::sqrt(4000.0 / 2.0 / 1.3 * 1.0e9);
-    double rho = 1.0e-9;
-    int target_node = 0;
-    int force_node = 0;
-    int force_dof = 2; // z方向に力を加える
-    double force_magnitude = -1.0;
+    Config cfg;
+    cfg.load("config.txt");
+
+    double duration = cfg.get_double("duration");
+    int num_steps = cfg.get_int("num_steps");
+    int sample_freq = cfg.get_int("sample_freq");
+    double c1 = cfg.get_double("c1");
+    double c2 = cfg.get_double("c2");
+    double rho = cfg.get_double("rho");
+    int target_node = cfg.get_int("target_node") - 1;
+    int force_node = cfg.get_int("force_node") - 1;
+    int force_dof = cfg.get_int("force_dof");
+    double force_magnitude = cfg.get_double("force_magnitude");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
 
@@ -141,7 +144,7 @@ int main()
     acc_set_device_num(0, acc_device_nvidia); // GPU 0 を使用
     acc_init(acc_device_nvidia);
 
-    FEMMesh mesh = read_vtk(filepath);
+    FEMMesh mesh = read_vtk("column.vtk");
     print_mesh_info(mesh);
 
     double *node_coords = mesh.coords_ptr();

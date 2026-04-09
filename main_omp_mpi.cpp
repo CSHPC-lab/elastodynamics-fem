@@ -1,17 +1,18 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvc++ main_omp.cpp vtk_reader.cpp -fopenmp
+mpicxx main_omp_mpi.cpp msh_reader.cpp -fopenmp
 ./a.out
 */
 
-#include "vtk_reader.hpp"
+#include "msh_reader.hpp"
 #include "config.hpp"
 #include <iostream>
 #include <cmath>
 #include <ctime>
 #include <sys/stat.h>
 #include <omp.h>
+#include <mpi.h>
 
 void calculate_dN(double dN[30], double r, double s, double t);
 void gauss_integrate(double dN0[30], double dN1[30], double dN2[30], double dN3[30]);
@@ -83,6 +84,17 @@ void bcrs_spmv_m(
     double *x,
     double *y);
 int pcg_solve(
+    MPI_Request *requests,
+    int num_neighbors,
+    int *neighbor_ranks,
+    int *recv_starts,
+    int *recv_counts,
+    int *send_starts,
+    int *send_counts,
+    int *send_nodes,
+    double *send_buffer,
+    int num_inner,
+    int num_owned,
     int num_nodes,
     int *bcrs_row_ptr,
     int *bcrs_col_ind,
@@ -113,9 +125,18 @@ void write_node_disp_csv(
     int sample_freq,
     double dt);
 
-int main()
+int main(int argc, char *argv[])
 {
-    double start_time = omp_get_wtime();
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Request requests[100];
+
+    double start_time = MPI_Wtime();
+
+    FEMMesh mesh = read_msh("column_4.msh", rank + 1);
+    print_mesh_info(mesh);
 
     Config cfg;
     cfg.load("config.txt");
@@ -126,8 +147,8 @@ int main()
     double c1 = cfg.get_double("c1");
     double c2 = cfg.get_double("c2");
     double rho = cfg.get_double("rho");
-    int target_node = cfg.get_int("target_node") - 1;
-    int force_node = cfg.get_int("force_node") - 1;
+    int target_node = get_local_id(mesh, cfg.get_int("target_node"));
+    int force_node = get_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
 
@@ -139,13 +160,39 @@ int main()
 
     printf("使用可能な最大スレッド数：%d\n", omp_get_max_threads());
 
-    FEMMesh mesh = read_vtk("column.vtk");
-    print_mesh_info(mesh);
-
     double *node_coords = mesh.coords_ptr();
-    int num_nodes = mesh.num_nodes;
-    int *ele_nodes = mesh.tet_ptr();
-    int num_elements = mesh.num_tets;
+    int num_nodes = mesh.num_total;
+    int num_inner = mesh.num_inner;
+    int num_bdr = mesh.num_bdr;
+    int num_owned = mesh.num_owned;
+    int num_ghost = mesh.num_ghost;
+    int *ele_nodes = mesh.elem_ptr();
+    int num_elements = mesh.num_total_elems;
+
+    int num_neighbors = mesh.num_neighbors();
+    int neighbor_ranks[num_neighbors];
+    int recv_starts[num_neighbors];     // 受信節点の開始位置（ローカルID配列中の位置）
+    int recv_counts[num_neighbors];     // 受信節点数（受信節点のメモリは隣接プロセス単位で連続）
+    std::vector<int> send_nodes;        // 送信節点のローカルIDを格納する配列（隣接プロセス単位で連続、ローカルID配列は連続ではない）
+    int send_starts[num_neighbors + 1]; // 送信節点の開始位置（send_nodes配列中の位置、最後の要素は全送信節点数）
+    int send_counts[num_neighbors];     // 送信節点数（send_nodes配列中の数）
+    for (int i = 0; i < num_neighbors; i++)
+    {
+        neighbor_ranks[i] = mesh.neighbors[i].partition_id - 1; // 0-indexed に変換
+        recv_starts[i] = mesh.neighbors[i].recv_start;
+        recv_counts[i] = mesh.neighbors[i].recv_count;
+        send_starts[i] = 0;
+        send_counts[i] = mesh.neighbors[i].send_size();
+        if (i > 0)
+        {
+            send_starts[i] = send_starts[i - 1] + send_counts[i - 1];
+        }
+        send_nodes.insert(send_nodes.end(), mesh.neighbors[i].send_nodes.begin(), mesh.neighbors[i].send_nodes.end());
+    }
+    send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
+    int *send_nodes_ptr = send_nodes.data();
+    double send_buffer[send_starts[num_neighbors] * 3]; // 送信節点数 * 3 (x,y,z)
+
     double dN0[30] = {0.0};                                      // ガウス点での形状関数の微分の配列
     double dN1[30] = {0.0};                                      // ガウス点での形状関数の微分の配列
     double dN2[30] = {0.0};                                      // ガウス点での形状関数の微分の配列
@@ -226,22 +273,29 @@ int main()
         double t = step * dt;
         double bc_val[3] = {0.0, 0.0, 0.0};
 
-        // ここでrhsを構築（外力の寄与なども加える）
+        // ここでrhsを構築（外力の寄与なども加える） u, v, aは全節点について、前のタイムステップから正しい値を引き継いでいる
 #pragma omp parallel for
         for (int i = 0; i < num_nodes * 3; i++)
         {
             // Newmark-β法の右辺の構築
             tmp[i] = u_tmp[i] * 4.0 / dt / dt + v_tmp[i] * 4.0 / dt + a_tmp[i];
         }
-        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与
-        rhs[force_node * 3 + force_dof] += force_magnitude;                      // 外力の寄与
+        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与 rhsは所有節点について正しい値を持つ
+        if (force_node >= 0)
+        {
+            rhs[force_node * 3 + force_dof] += force_magnitude; // 外力の寄与
+        }
 
         apply_bc_to_rhs(num_nodes, bc_flag, bc_val, bc_corr, rhs);
 
-        int iter = pcg_solve(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3, r, z, p, Ap);
-        std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
+        int iter = pcg_solve(requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer,
+                             num_inner, num_owned, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3, r, z, p, Ap);
+        if (rank == 0)
+        {
+            std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
+        }
 
-        // 速度と加速度の更新（Newmark-β法）
+        // 速度と加速度の更新（Newmark-β法） u,v,aは全節点について正しい値をもつ
 #pragma omp parallel for
         for (int i = 0; i < num_nodes; i++)
         {
@@ -300,40 +354,52 @@ int main()
         }
     }
 
-    // --- 出力前にディレクトリ作成 ---
-    // タイムスタンプ生成
-    time_t now = time(nullptr);
-    struct tm *lt = localtime(&now);
-    char timestamp[64];
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", lt);
+    if (target_node >= 0)
+    {
+        // --- 出力前にディレクトリ作成 ---
+        // タイムスタンプ生成
+        time_t now = time(nullptr);
+        struct tm *lt = localtime(&now);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", lt);
 
-    // results/20260323_143025/ のようなパスを作成
-    char output_dir[256];
-    sprintf(output_dir, "results/%s", timestamp);
+        // results/20260323_143025/ のようなパスを作成
+        char output_dir[256];
+        sprintf(output_dir, "results/%s", timestamp);
 
-    mkdir("results", 0755);  // 親ディレクトリ
-    mkdir(output_dir, 0755); // タイムスタンプディレクトリ
+        mkdir("results", 0755);  // 親ディレクトリ
+        mkdir(output_dir, 0755); // タイムスタンプディレクトリ
 
-    // 各ステップのVTKを出力
-    // for (int step = 0; step <= num_steps; step += sample_freq)
-    // {
-    //     char filename[512];
-    //     sprintf(filename, "%s/result_%04d.vtk", output_dir, step / sample_freq);
-    //     write_vtk_displacement(filename, node_coords, num_nodes,
-    //                            ele_nodes, num_elements, u[step / sample_freq],
-    //                            step * dt);
-    // }
+        // 各ステップのVTKを出力
+        // for (int step = 0; step <= num_steps; step += sample_freq)
+        // {
+        //     char filename[512];
+        //     sprintf(filename, "%s/result_%04d.vtk", output_dir, step / sample_freq);
+        //     write_vtk_displacement(filename, node_coords, num_nodes,
+        //                            ele_nodes, num_elements, u[step / sample_freq],
+        //                            step * dt);
+        // }
 
-    char csv_filename[512];
-    sprintf(csv_filename, "%s/node%d_disp.csv", output_dir, target_node + 1);
-    write_node_disp_csv(csv_filename, num_nodes, target_node, u, num_steps, sample_freq, dt);
+        char csv_filename[512];
+        sprintf(csv_filename, "%s/target_disp.csv", output_dir);
+        write_node_disp_csv(csv_filename, num_nodes, target_node, u, num_steps, sample_freq, dt);
 
-    printf("Output: %s/\n", output_dir);
-    printf("CSV: %s\n", csv_filename);
+        printf("Output: %s/\n", output_dir);
+        printf("CSV: %s\n", csv_filename);
+    }
 
-    double end_time = omp_get_wtime();
+    double end_time = MPI_Wtime();
 
-    printf("Total execution time: %.2f seconds\n", end_time - start_time);
+    double elapsed_time = end_time - start_time;
+    double max_elapsed_time;
+    MPI_Reduce(&elapsed_time, &max_elapsed_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+        printf("Total elapsed time: %.2f seconds\n", max_elapsed_time);
+    }
+
+    MPI_Finalize();
 
     return 0;
 }
@@ -853,6 +919,17 @@ double dot(int n, double *a, double *b)
 }
 
 int pcg_solve(
+    MPI_Request *request,
+    int num_neighbors,
+    int *neighbor_ranks,
+    int *recv_starts,
+    int *recv_counts,
+    int *send_starts,
+    int *send_counts,
+    int *send_nodes,
+    double *send_buffer,
+    int num_inner,
+    int num_owned,
     int num_nodes,
     int *row_ptr,
     int *col_ind,
@@ -869,15 +946,14 @@ int pcg_solve(
 {
     // Ax = b を前処理付き共役勾配法で解く。
     // x は初期解を入れて呼ぶ（ゼロでもよい）。解が上書きされる。
-    int ndof = num_nodes * 3;
     double rz = 0.0;
     double b_norm = 0.0;
     double r_norm = 0.0;
 
 #pragma omp parallel for reduction(+ : rz, b_norm, r_norm)
-    for (int i = 0; i < num_nodes; i++)
+    for (int i = 0; i < num_owned; i++)
     {
-        // r = b - A*x
+        // r = b - A*x　r,bは所有節点について、xは全節点について正しい値が入っている
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
         for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
         {
@@ -902,7 +978,7 @@ int pcg_solve(
         r[i * 3 + 1] = r1;
         r[i * 3 + 2] = r2;
 
-        // z = M⁻¹r
+        // z = C⁻¹r zは所有節点について正しい値が入る
         double z0 = inv_diag[9 * i + 3 * 0 + 0] * r0 + inv_diag[9 * i + 3 * 0 + 1] * r1 + inv_diag[9 * i + 3 * 0 + 2] * r2;
         double z1 = inv_diag[9 * i + 3 * 1 + 0] * r0 + inv_diag[9 * i + 3 * 1 + 1] * r1 + inv_diag[9 * i + 3 * 1 + 2] * r2;
         double z2 = inv_diag[9 * i + 3 * 2 + 0] * r0 + inv_diag[9 * i + 3 * 2 + 1] * r1 + inv_diag[9 * i + 3 * 2 + 2] * r2;
@@ -910,7 +986,7 @@ int pcg_solve(
         z[i * 3 + 1] = z1;
         z[i * 3 + 2] = z2;
 
-        // p = z
+        // p = z pは所有節点について正しい値が入る
         p[i * 3 + 0] = z0;
         p[i * 3 + 1] = z1;
         p[i * 3 + 2] = z2;
@@ -925,6 +1001,11 @@ int pcg_solve(
         r_norm += r0 * r0 + r1 * r1 + r2 * r2;
     }
 
+    MPI_Iallreduce(MPI_IN_PLACE, &rz, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[0]);
+    MPI_Iallreduce(MPI_IN_PLACE, &b_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[1]);
+    MPI_Iallreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[2]);
+    MPI_Waitall(3, request, MPI_STATUSES_IGNORE);
+
     if (b_norm == 0.0)
         b_norm = 1.0;
 
@@ -936,9 +1017,53 @@ int pcg_solve(
     int iter;
     for (iter = 0; iter < max_iter; iter++)
     {
+        // pは全節点について正しい必要があるので、ゴースト節点を送受信する。
+        for (int n = 0; n < num_neighbors; n++)
+        {
+            int send_start = send_starts[n];
+            // 送信用にまずはバッファにコピー
+#pragma omp parallel for
+            for (int i = 0; i < send_counts[n]; i++)
+            {
+                int node = send_nodes[send_start + i];
+                send_buffer[3 * (send_start + i) + 0] = p[node * 3 + 0];
+                send_buffer[3 * (send_start + i) + 1] = p[node * 3 + 1];
+                send_buffer[3 * (send_start + i) + 2] = p[node * 3 + 2];
+            }
+            // 送信
+            MPI_Isend(&send_buffer[3 * send_start], send_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+            // 受信
+            MPI_Irecv(&p[recv_starts[n] * 3], recv_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
+        }
+
         double pAp = 0.0;
+        // 通信が不要な内側の節点については先に計算しておく
 #pragma omp parallel for reduction(+ : pAp)
-        for (int i = 0; i < num_nodes; i++)
+        for (int i = 0; i < num_inner; i++)
+        {
+            // Ap = A * p Apは所有節点について正しい値が入る
+            double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+            for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
+            {
+                int j = col_ind[p_];
+                y0 += kval[9 * p_ + 3 * 0 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 0 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 0 + 2] * p[j * 3 + 2];
+                y1 += kval[9 * p_ + 3 * 1 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 1 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 1 + 2] * p[j * 3 + 2];
+                y2 += kval[9 * p_ + 3 * 2 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 2 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 2 + 2] * p[j * 3 + 2];
+            }
+            Ap[i * 3 + 0] = y0;
+            Ap[i * 3 + 1] = y1;
+            Ap[i * 3 + 2] = y2;
+
+            // pAp = p · Ap
+            pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
+        }
+
+        // ゴースト節点を待つ。pは全節点について正しい値が入る
+        MPI_Waitall(2 * num_neighbors, request, MPI_STATUSES_IGNORE);
+
+        // 通信が必要な外側の節点について計算
+#pragma omp parallel for reduction(+ : pAp)
+        for (int i = num_inner; i < num_owned; i++)
         {
             // Ap = A * p
             double y0 = 0.0, y1 = 0.0, y2 = 0.0;
@@ -957,21 +1082,38 @@ int pcg_solve(
             pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
         }
 
+        MPI_Allreduce(MPI_IN_PLACE, &pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
         // alpha = rz / (p · Ap)
         double alpha = rz / pAp;
 
+#pragma omp parallel for
+        for (int i = 0; i < num_nodes; i++)
+        {
+            // xの更新
+            // x += alpha * p xは全節点について正しい値が入る
+            x[i * 3 + 0] += alpha * p[i * 3 + 0];
+            x[i * 3 + 1] += alpha * p[i * 3 + 1];
+            x[i * 3 + 2] += alpha * p[i * 3 + 2];
+        }
+
         r_norm = 0.0;
 #pragma omp parallel for reduction(+ : r_norm)
-        for (int i = 0; i < ndof; i++)
+        for (int i = 0; i < num_owned; i++)
         {
-            // x += alpha * p, r -= alpha * Ap
-            x[i] += alpha * p[i];
-            double r_i = r[i] - alpha * Ap[i];
-            r[i] = r_i;
+            // r -= alpha * Ap rは所有節点について正しい値が入る
+            double r_i_0 = r[i * 3 + 0] - alpha * Ap[i * 3 + 0];
+            double r_i_1 = r[i * 3 + 1] - alpha * Ap[i * 3 + 1];
+            double r_i_2 = r[i * 3 + 2] - alpha * Ap[i * 3 + 2];
+            r[i * 3 + 0] = r_i_0;
+            r[i * 3 + 1] = r_i_1;
+            r[i * 3 + 2] = r_i_2;
 
             // rのノルム
-            r_norm += r_i * r_i;
+            r_norm += r_i_0 * r_i_0 + r_i_1 * r_i_1 + r_i_2 * r_i_2;
         }
+
+        MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         // 収束判定
         if (r_norm / b_norm < tol * tol)
@@ -982,9 +1124,9 @@ int pcg_solve(
 
         double rz_new = 0.0;
 #pragma omp parallel for reduction(+ : rz_new)
-        for (int i = 0; i < num_nodes; i++)
+        for (int i = 0; i < num_owned; i++)
         {
-            // z = M⁻¹r
+            // z = C⁻¹r zは所有節点について正しい値が入る
             double r0 = r[i * 3 + 0];
             double r1 = r[i * 3 + 1];
             double r2 = r[i * 3 + 2];
@@ -999,14 +1141,18 @@ int pcg_solve(
             rz_new += r0 * z0 + r1 * z1 + r2 * z2;
         }
 
+        MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
         // beta = rz_new / rz
         double beta = rz_new / rz;
 
-        // p = z + beta * p
+        // p = z + beta * p pは所有節点について正しい値が入る
 #pragma omp parallel for
-        for (int i = 0; i < ndof; i++)
+        for (int i = 0; i < num_owned; i++)
         {
-            p[i] = z[i] + beta * p[i];
+            p[i * 3 + 0] = z[i * 3 + 0] + beta * p[i * 3 + 0];
+            p[i * 3 + 1] = z[i * 3 + 1] + beta * p[i * 3 + 1];
+            p[i * 3 + 2] = z[i * 3 + 2] + beta * p[i * 3 + 2];
         }
 
         rz = rz_new;

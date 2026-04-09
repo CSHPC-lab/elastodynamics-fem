@@ -1,0 +1,15 @@
+# Simulation parameters
+duration        0.005
+num_steps       10000
+sample_freq     10
+
+# Material properties
+c1              2320477.40446128555
+c2              1240347.34589208456
+rho             1.0e-9
+
+# Loading
+target_node     1
+force_node      1
+force_dof       2
+force_magnitude -1.0
