@@ -11,6 +11,8 @@
 . /etc/profile.d/modules.sh
 export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 
+g++ -Iinclude column.cpp -Llib -lgmsh
+export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 ./a.out
 
 echo "Job finished at $(date)"

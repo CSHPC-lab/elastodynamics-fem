@@ -33,16 +33,17 @@ from math import sin
 # ---------------------------------------------------------------------------
 # Material / amplitude parameters
 # ---------------------------------------------------------------------------
-YOUNG      = 16000000.0 / 3.0
-POISSON    = 2.0 / 3.0
-DENSITY    = 2000.0
-AMP_DT     = 0.000625   # amplitude table time step [s]
-AMP_END    = 20.0   # amplitude table end time [s]
+YOUNG = 160000000.0 / 3.0
+POISSON = 1.0 / 3.0
+DENSITY = 2000.0
+AMP_DT = 0.000625  # amplitude table time step [s]
+AMP_END = 20.0  # amplitude table end time [s]
 
 
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
+
 
 def parse_gmsh(filename):
     """Return (nodes, tet10_elems, tri6_by_geomtag).
@@ -59,19 +60,19 @@ def parse_gmsh(filename):
     with open(filename) as f:
         for raw in f:
             line = raw.strip()
-            if line == '$Nodes':
-                section = 'nodes'
+            if line == "$Nodes":
+                section = "nodes"
                 continue
-            if line == '$EndNodes':
+            if line == "$EndNodes":
                 section = None
                 continue
-            if line == '$Elements':
-                section = 'elements'
+            if line == "$Elements":
+                section = "elements"
                 continue
-            if line == '$EndElements':
+            if line == "$EndElements":
                 section = None
                 continue
-            if line.startswith('$'):
+            if line.startswith("$"):
                 section = None
                 continue
 
@@ -79,7 +80,7 @@ def parse_gmsh(filename):
                 continue
             parts = line.split()
 
-            if section == 'nodes':
+            if section == "nodes":
                 if len(parts) == 4:
                     try:
                         nid = int(parts[0])
@@ -88,22 +89,25 @@ def parse_gmsh(filename):
                     except ValueError:
                         pass
 
-            elif section == 'elements':
+            elif section == "elements":
                 if len(parts) < 4:
                     continue
                 try:
-                    eid   = int(parts[0])
+                    eid = int(parts[0])
                     etype = int(parts[1])
                     ntags = int(parts[2])
                     # tags[0] = physical tag, tags[1] = geometric tag
-                    tags     = [int(parts[3 + i]) for i in range(ntags)]
+                    tags = [int(parts[3 + i]) for i in range(ntags)]
                     geom_tag = tags[1] if ntags >= 2 else 0
-                    node_ids = [int(parts[3 + ntags + i])
-                                for i in range(len(parts) - 3 - ntags)]
+                    node_ids = [
+                        int(parts[3 + ntags + i]) for i in range(len(parts) - 3 - ntags)
+                    ]
 
-                    if etype == 11:   # tet10
+                    if etype == 11:  # tet10
                         if len(node_ids) != 10:
-                            raise ValueError(f'tet10 element {eid} has {len(node_ids)} nodes')
+                            raise ValueError(
+                                f"tet10 element {eid} has {len(node_ids)} nodes"
+                            )
                         tmp = node_ids[4]
                         node_ids[4] = node_ids[5]
                         node_ids[5] = node_ids[6]
@@ -115,11 +119,13 @@ def parse_gmsh(filename):
 
                     elif etype == 9:  # tri6
                         if len(node_ids) != 6:
-                            raise ValueError(f'tri6 element {eid} has {len(node_ids)} nodes')
+                            raise ValueError(
+                                f"tri6 element {eid} has {len(node_ids)} nodes"
+                            )
                         tri6_by_geomtag.setdefault(geom_tag, []).append((eid, node_ids))
 
                 except ValueError as e:
-                    print(f'  Warning: {e}', file=sys.stderr)
+                    print(f"  Warning: {e}", file=sys.stderr)
 
     return nodes, tet10_elems, tri6_by_geomtag
 
@@ -144,14 +150,14 @@ def find_centroid_node(nodes, tri6_list):
     cy = sum(ys) / len(ys)
     cz = sum(zs) / len(zs)
 
-    best_nid  = None
-    best_dist = float('inf')
+    best_nid = None
+    best_dist = float("inf")
     for nid in face_nids:
         x, y, z = nodes[nid]
-        d = (x - cx)**2 + (y - cy)**2 + (z - cz)**2
+        d = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
         if d < best_dist:
             best_dist = d
-            best_nid  = nid
+            best_nid = nid
     return best_nid
 
 
@@ -159,104 +165,110 @@ def find_centroid_node(nodes, tri6_list):
 # Writing
 # ---------------------------------------------------------------------------
 
+
 def fmt_node_coord(v):
     """Format a node coordinate in the same style as REVOCAP output."""
-    return f'{v:.8e}'
+    return f"{v:.8e}"
 
 
 def fmt_amp_time(t):
     """Format amplitude time as 5-digit scientific notation (e.g. 1.00000E-05)."""
-    return f'{t:.5E}'
+    return f"{t:.5E}"
 
 
 def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
-    with open(output_file, 'w') as f:
+    with open(output_file, "w") as f:
 
         # --- header ---
-        f.write('!HEADER\n')
-        f.write(' HECMW_MSH File generated by convert_gmsh_to_fistr.py\n')
+        f.write("!HEADER\n")
+        f.write(" HECMW_MSH File generated by convert_gmsh_to_fistr.py\n")
 
         # --- nodes ---
-        f.write('!NODE\n')
+        f.write("!NODE\n")
         for nid in sorted(nodes):
             x, y, z = nodes[nid]
-            f.write(f'        {nid:6d}, {fmt_node_coord(x)}, '
-                    f'{fmt_node_coord(y)}, {fmt_node_coord(z)}\n')
+            f.write(
+                f"        {nid:6d}, {fmt_node_coord(x)}, "
+                f"{fmt_node_coord(y)}, {fmt_node_coord(z)}\n"
+            )
 
         # --- volume elements ---
         # Gmsh tet10 (type 11) and FrontISTR tet10 (type 342) share the same
         # node ordering, so the connectivity is copied verbatim.
-        f.write('!ELEMENT, TYPE=342, EGRP=column_0\n')
+        f.write("!ELEMENT, TYPE=342, EGRP=column_0\n")
         for eid, nids in tet10_elems:
-            f.write(f'{eid},' + ','.join(str(n) for n in nids) + '\n')
+            f.write(f"{eid}," + ",".join(str(n) for n in nids) + "\n")
 
         # --- material ---
-        f.write('!MATERIAL, NAME=M1, ITEM=2\n')
-        f.write('!ITEM=1, SUBITEM=2\n')
-        f.write(f' {YOUNG}, {POISSON}\n')
-        f.write('!ITEM=2, SUBITEM=1\n')
-        f.write(f' {DENSITY:.1E}\n')
+        f.write("!MATERIAL, NAME=M1, ITEM=2\n")
+        f.write("!ITEM=1, SUBITEM=2\n")
+        f.write(f" {YOUNG}, {POISSON}\n")
+        f.write("!ITEM=2, SUBITEM=1\n")
+        f.write(f" {DENSITY:.1E}\n")
 
         # --- section ---
-        f.write('!SECTION, TYPE=SOLID, EGRP=column_0, MATERIAL=M1\n')
+        f.write("!SECTION, TYPE=SOLID, EGRP=column_0, MATERIAL=M1\n")
 
         # --- FIX node group (x=0 face: all nodes from geom_tag=1 triangles) ---
-        f.write('!NGROUP, NGRP=FIX\n')
+        f.write("!NGROUP, NGRP=FIX\n")
         for nid in fix_nodes:
-            f.write(f'{nid},\n')
+            f.write(f"{nid},\n")
 
         # # --- CL1 node group (centroid of free-end face) ---
         # f.write('!NGROUP, NGRP=CL1\n')
         # f.write(f'{cl1_node},\n')
 
         # --- amplitude (sin(t) load) ---
-        f.write('!AMPLITUDE, NAME=AMP1\n')
+        f.write("!AMPLITUDE, NAME=AMP1\n")
         n_steps = round(AMP_END / AMP_DT)
         for i in range(n_steps + 1):
             t = i * AMP_DT
             wave = sin(t)
-            f.write(f'{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n')
+            f.write(f"{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n")
 
-        f.write('!END\n')
+        f.write("!END\n")
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    input_file  = os.path.join(os.path.dirname(__file__), 'column.msh')
-    output_file = os.path.join(os.path.dirname(__file__), 'column_fistr.msh')
+    input_file = os.path.join(os.path.dirname(__file__), "column.msh")
+    output_file = os.path.join(os.path.dirname(__file__), "column_fistr.msh")
 
     if len(sys.argv) > 1:
         input_file = sys.argv[1]
     if len(sys.argv) > 2:
         output_file = sys.argv[2]
 
-    print(f'Reading  : {input_file}')
+    print(f"Reading  : {input_file}")
     nodes, tet10_elems, tri6_by_geomtag = parse_gmsh(input_file)
 
-    print(f'  nodes          : {len(nodes)}')
-    print(f'  tet10 elements : {len(tet10_elems)}')
-    print(f'  tri6 by geom   : { {k: len(v) for k, v in sorted(tri6_by_geomtag.items())} }')
+    print(f"  nodes          : {len(nodes)}")
+    print(f"  tet10 elements : {len(tet10_elems)}")
+    print(
+        f"  tri6 by geom   : { {k: len(v) for k, v in sorted(tri6_by_geomtag.items())} }"
+    )
 
     # --- FIX group: all nodes on z=0 face (geom_tag = 5) ---
     if 5 not in tri6_by_geomtag:
-        sys.exit('ERROR: no tri6 elements with geom_tag=5 found (expected z=0 face)')
+        sys.exit("ERROR: no tri6 elements with geom_tag=5 found (expected z=0 face)")
     fix_nodes = face_nodes(tri6_by_geomtag[5])
-    print(f'  FIX group      : {len(fix_nodes)} nodes (geom_tag=5)')
+    print(f"  FIX group      : {len(fix_nodes)} nodes (geom_tag=5)")
 
     # --- CL1: centroid node of x=10 face (geom_tag = 2) ---
     if 2 not in tri6_by_geomtag:
-        sys.exit('ERROR: no tri6 elements with geom_tag=2 found (expected x=10 face)')
+        sys.exit("ERROR: no tri6 elements with geom_tag=2 found (expected x=10 face)")
     cl1_node = find_centroid_node(nodes, tri6_by_geomtag[2])
     cx, cy, cz = nodes[cl1_node]
-    print(f'  CL1 node       : {cl1_node}  ({cx}, {cy}, {cz})')
+    print(f"  CL1 node       : {cl1_node}  ({cx}, {cy}, {cz})")
 
-    print(f'Writing  : {output_file}')
+    print(f"Writing  : {output_file}")
     write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node)
-    print('Done.')
+    print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

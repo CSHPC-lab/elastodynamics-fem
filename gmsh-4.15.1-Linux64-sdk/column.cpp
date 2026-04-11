@@ -27,10 +27,11 @@ int main(int argc, char **argv)
     gmsh::model::occ::synchronize();
 
     // メッシュサイズの設定
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 5.0);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 4.0);
 
-    // より高品質な3Dメッシュを求める場合は、HXTアルゴリズム(10)やFrontal(4)の指定が有効です（任意）
-    // gmsh::option::setNumber("Mesh.Algorithm3D", 10);
+    // 3Dメッシュ生成の並列化（HXTアルゴリズムが必要）
+    gmsh::option::setNumber("Mesh.Algorithm3D", 10);     // HXT
+    gmsh::option::setNumber("Mesh.MaxNumThreads3D", 24); // スレッド数（コア数に合わせる）
 
     // 3Dメッシュ生成
     gmsh::model::mesh::generate(3);
@@ -49,7 +50,7 @@ int main(int argc, char **argv)
     gmsh::write("column.msh");
 
     // ===== パーティション追加 =====
-    int nParts = 16; // MPI並列数に合わせる
+    int nParts = 1; // MPI並列数に合わせる
 
     // K-way: 3分割以上ではRecursiveより均等になりやすい
     gmsh::option::setNumber("Mesh.MetisAlgorithm", 2);
@@ -70,7 +71,10 @@ int main(int argc, char **argv)
     // ゴーストセルを作る ($GhostElements用)
     gmsh::option::setNumber("Mesh.PartitionCreateGhostCells", 1);
 
-    gmsh::model::mesh::partition(nParts);
+    if (nParts > 1)
+    {
+        gmsh::model::mesh::partition(nParts);
+    }
 
     // MSH 4.1 で出力
     gmsh::option::setNumber("Mesh.MshFileVersion", 4.1);

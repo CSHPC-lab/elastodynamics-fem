@@ -246,13 +246,13 @@ FEMMesh read_msh(const std::string &filepath, int partition)
     std::map<int, std::set<int>> node_element_owners;
     for (const auto &e : all_elems)
     {
+        int e_owner = partition; // デフォルト: 自分
         auto vit = entity_partitions.find({3, e.entity_tag});
         if (vit != entity_partitions.end() && !vit->second.empty())
-        {
-            int e_owner = *vit->second.begin();
-            for (int n : e.nodes)
-                node_element_owners[n].insert(e_owner);
-        }
+            e_owner = *vit->second.begin();
+
+        for (int n : e.nodes)
+            node_element_owners[n].insert(e_owner);
     }
 
     std::map<int, int> node_owner;
@@ -271,13 +271,10 @@ FEMMesh read_msh(const std::string &filepath, int partition)
 
     for (const auto &e : all_elems)
     {
-        int e_owner = -1;
+        int e_owner = partition; // デフォルト: 自分
         auto vit = entity_partitions.find({3, e.entity_tag});
         if (vit != entity_partitions.end() && !vit->second.empty())
             e_owner = *vit->second.begin();
-
-        if (e_owner == -1)
-            continue;
 
         // 【判定】この要素は、誰の手元に残るか？ (自分の担当節点を含むパーティション全員)
         std::set<int> keepers;

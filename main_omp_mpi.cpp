@@ -118,8 +118,6 @@ void write_vtk_displacement(
     double total_time);
 void write_node_disp_csv(
     const char *filename,
-    int num_nodes,
-    int target_node,
     double *u,
     int num_steps,
     int sample_freq,
@@ -202,6 +200,16 @@ int main(int argc, char *argv[])
     int *coo_row = new int[100 * num_elements]();                // 要素行列の行インデックスの配列
     int *coo_col = new int[100 * num_elements]();                // 要素行列の列インデックスの配列
 
+    if (target_node >= 0)
+    {
+        printf("Target node local ID: %d\n", target_node);
+        printf("Target node global ID: %d\n", mesh.local_to_global[target_node]);
+        printf("Target node coordinates: (%.3f, %.3f, %.3f)\n",
+               node_coords[target_node * 3],
+               node_coords[target_node * 3 + 1],
+               node_coords[target_node * 3 + 2]);
+    }
+
     gauss_integrate(dN0, dN1, dN2, dN3);
 
     construct_mat(node_coords,
@@ -239,11 +247,11 @@ int main(int argc, char *argv[])
     int *bc_flag = new int[num_nodes]();
     double *bc_corr = new double[num_nodes * 3 * 3];
     double *inv_diag = new double[num_nodes * 9];
-    double *u = new double[(num_steps / sample_freq + 1) * num_nodes * 3](); // 変位の記録
-    double *u_tmp = new double[num_nodes * 3]();                             // タイムステップごとの変位の一時保存用
-    double *v_tmp = new double[num_nodes * 3]();                             // タイムステップごとの速度の一時保存用
-    double *a_tmp = new double[num_nodes * 3]();                             // タイムステップごとの加速度の一時保存用
-    double *u_prv = new double[num_nodes * 3]();                             // タイムステップごとの過去の変位の一時保存用
+    double *u = new double[(num_steps / sample_freq + 1) * 3](); // 変位の記録
+    double *u_tmp = new double[num_nodes * 3]();                 // タイムステップごとの変位の一時保存用
+    double *v_tmp = new double[num_nodes * 3]();                 // タイムステップごとの速度の一時保存用
+    double *a_tmp = new double[num_nodes * 3]();                 // タイムステップごとの加速度の一時保存用
+    double *u_prv = new double[num_nodes * 3]();                 // タイムステップごとの過去の変位の一時保存用
     double *rhs = new double[num_nodes * 3]();
     double *tmp = new double[num_nodes * 3]();
 
@@ -257,8 +265,19 @@ int main(int argc, char *argv[])
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
-        if (node_coords[i * 3] < 1e-6)
+        if (node_coords[i * 3 + 2] < 1e-6)
+        {
             bc_flag[i] = 1;
+            // u_tmp[i * 3 + 0] = 0.0;
+            // u_tmp[i * 3 + 1] = sin(0.0);
+            // u_tmp[i * 3 + 2] = 0.0;
+            // v_tmp[i * 3 + 0] = 0.0;
+            // v_tmp[i * 3 + 1] = cos(0.0);
+            // v_tmp[i * 3 + 2] = 0.0;
+            // a_tmp[i * 3 + 0] = 0.0;
+            // a_tmp[i * 3 + 1] = -sin(0.0);
+            // a_tmp[i * 3 + 2] = 0.0;
+        }
     }
 
     extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag, bc_corr);
@@ -267,11 +286,23 @@ int main(int argc, char *argv[])
 
     build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
 
+    double bc_val_u[3] = {0.0};
+    double bc_val_v[3] = {0.0};
+    double bc_val_a[3] = {0.0};
+
     // タイムステップループ
     for (int step = 1; step <= num_steps; step++)
     {
         double t = step * dt;
-        double bc_val[3] = {0.0, 0.0, 0.0};
+        bc_val_u[0] = 0.0;
+        bc_val_u[1] = sin(t);
+        bc_val_u[2] = 0.0;
+        bc_val_v[0] = 0.0;
+        bc_val_v[1] = cos(t);
+        bc_val_v[2] = 0.0;
+        bc_val_a[0] = 0.0;
+        bc_val_a[1] = -sin(t);
+        bc_val_a[2] = 0.0;
 
         // ここでrhsを構築（外力の寄与なども加える） u, v, aは全節点について、前のタイムステップから正しい値を引き継いでいる
 #pragma omp parallel for
@@ -286,7 +317,7 @@ int main(int argc, char *argv[])
             rhs[force_node * 3 + force_dof] += force_magnitude; // 外力の寄与
         }
 
-        apply_bc_to_rhs(num_nodes, bc_flag, bc_val, bc_corr, rhs);
+        apply_bc_to_rhs(num_nodes, bc_flag, bc_val_u, bc_corr, rhs);
 
         int iter = pcg_solve(requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer,
                              num_inner, num_owned, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3, r, z, p, Ap);
@@ -321,15 +352,15 @@ int main(int argc, char *argv[])
 
             if (bc_flag[i])
             {
-                u_new_0 = bc_val[0];
-                u_new_1 = bc_val[1];
-                u_new_2 = bc_val[2];
-                v_new_0 = 0.0;
-                v_new_1 = 0.0;
-                v_new_2 = 0.0;
-                a_new_0 = 0.0;
-                a_new_1 = 0.0;
-                a_new_2 = 0.0;
+                u_new_0 = bc_val_u[0];
+                u_new_1 = bc_val_u[1];
+                u_new_2 = bc_val_u[2];
+                v_new_0 = bc_val_v[0];
+                v_new_1 = bc_val_v[1];
+                v_new_2 = bc_val_v[2];
+                a_new_0 = bc_val_a[0];
+                a_new_1 = bc_val_a[1];
+                a_new_2 = bc_val_a[2];
             }
 
             u_prv[i * 3 + 0] = u_new_0;
@@ -346,10 +377,11 @@ int main(int argc, char *argv[])
         // 解xを変位uに保存
         if (step % sample_freq == 0)
         {
-#pragma omp parallel for
-            for (int i = 0; i < num_nodes * 3; i++)
+            if (target_node >= 0) // 自プロセスに対象ノードがある場合のみ保存
             {
-                u[(step / sample_freq) * num_nodes * 3 + i] = u_tmp[i];
+                u[(step / sample_freq) * 3 + 0] = u_tmp[target_node * 3 + 0];
+                u[(step / sample_freq) * 3 + 1] = u_tmp[target_node * 3 + 1];
+                u[(step / sample_freq) * 3 + 2] = u_tmp[target_node * 3 + 2];
             }
         }
     }
@@ -382,7 +414,7 @@ int main(int argc, char *argv[])
 
         char csv_filename[512];
         sprintf(csv_filename, "%s/target_disp.csv", output_dir);
-        write_node_disp_csv(csv_filename, num_nodes, target_node, u, num_steps, sample_freq, dt);
+        write_node_disp_csv(csv_filename, u, num_steps, sample_freq, dt);
 
         printf("Output: %s/\n", output_dir);
         printf("CSV: %s\n", csv_filename);
@@ -1234,8 +1266,6 @@ void write_vtk_displacement(
 
 void write_node_disp_csv(
     const char *filename,
-    int num_nodes,
-    int target_node,
     double *u,
     int num_steps,
     int sample_freq,
@@ -1247,9 +1277,10 @@ void write_node_disp_csv(
     {
         double t = step * dt;
         int idx = step / sample_freq;
-        double ux = u[idx * num_nodes * 3 + target_node * 3 + 0];
-        double uy = u[idx * num_nodes * 3 + target_node * 3 + 1];
-        double uz = u[idx * num_nodes * 3 + target_node * 3 + 2];
+        // 配列にはターゲットノードのデータしかないので直接アクセスする
+        double ux = u[idx * 3 + 0];
+        double uy = u[idx * 3 + 1];
+        double uz = u[idx * 3 + 2];
         double mag = sqrt(ux * ux + uy * uy + uz * uz);
         fprintf(csv_fp, "%.10e,%.10e,%.10e,%.10e,%.10e\n", t, ux, uy, uz, mag);
     }

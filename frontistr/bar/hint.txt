@@ -1,3 +1,6 @@
 並列数を増やすには
 hecmw_part_ctrl.datのDOMAIN=8を更新
 job.shのmpirun -n 8 fistr1を更新
+
+リソース確認
+pjstat --nodeuse

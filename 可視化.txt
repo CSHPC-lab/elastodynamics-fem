@@ -1,3 +1,0 @@
-ssh lynx-vis01
-module load ParaView/5.13.2-egl
-pvserver --force-offscreen-rendering -p 11111
