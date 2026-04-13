@@ -1,7 +1,7 @@
 # Simulation parameters
 duration        20.0
-num_steps       1000
-sample_freq     1
+num_steps       8000
+sample_freq     4
 
 # Material properties
 c1              200

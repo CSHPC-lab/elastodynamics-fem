@@ -5,3 +5,7 @@ pvserver --force-offscreen-rendering -p 11111
 
 転送
 scp gmsh-4.15.1-Linux64-sdk/4.0/column.msh b25005@wisteria.cc.u-tokyo.ac.jp:/data/scratch/gb25/b25005/elastodynamics-fem/frontistr/4.0
+
+ncu可視化
+ubuntuで
+sudo /usr/local/NVIDIA-Nsight-Compute/ncu-ui

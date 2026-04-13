@@ -38,6 +38,7 @@ POISSON = 1.0 / 3.0
 DENSITY = 2000.0
 AMP_DT = 0.000625  # amplitude table time step [s]
 AMP_END = 20.0  # amplitude table end time [s]
+WAVE_AMP = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,7 @@ def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
         n_steps = round(AMP_END / AMP_DT)
         for i in range(n_steps + 1):
             t = i * AMP_DT
-            wave = sin(t)
+            wave = WAVE_AMP * sin(t)
             f.write(f"{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n")
 
         f.write("!END\n")

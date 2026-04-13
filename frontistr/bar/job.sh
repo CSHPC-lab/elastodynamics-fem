@@ -1,8 +1,8 @@
 #!/bin/sh
 #PJM -g gb25
 #PJM -L rscgrp=short-o
-#PJM -L node=16
-#PJM --mpi proc=64
+#PJM -L node=1
+#PJM --mpi proc=4
 #PJM --omp thread=12
 #PJM -L elapse=08:00:00
 #PJM -j
@@ -19,7 +19,7 @@ module load hdf5/1.12.0
 
 cd ${PJM_O_WORKDIR}
 mpirun -n 1 hecmw_part1
-mpirun -n 64 fistr1
+mpirun -n 4 fistr1
 
 rm column_fistr_4.*
 rm column_fistr.res.*

@@ -8,6 +8,9 @@ export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 
 int main(int argc, char **argv)
 {
+    const double mesh_size = 0.5; // メッシュサイズの目安
+    const int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
+
     gmsh::initialize();
     gmsh::model::add("column");
 
@@ -27,7 +30,7 @@ int main(int argc, char **argv)
     gmsh::model::occ::synchronize();
 
     // メッシュサイズの設定
-    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", 4.0);
+    gmsh::option::setNumber("Mesh.CharacteristicLengthMax", mesh_size);
 
     // 3Dメッシュ生成の並列化（HXTアルゴリズムが必要）
     gmsh::option::setNumber("Mesh.Algorithm3D", 10);     // HXT
@@ -50,8 +53,6 @@ int main(int argc, char **argv)
     gmsh::write("column.msh");
 
     // ===== パーティション追加 =====
-    int nParts = 1; // MPI並列数に合わせる
-
     // K-way: 3分割以上ではRecursiveより均等になりやすい
     gmsh::option::setNumber("Mesh.MetisAlgorithm", 2);
 
@@ -71,9 +72,9 @@ int main(int argc, char **argv)
     // ゴーストセルを作る ($GhostElements用)
     gmsh::option::setNumber("Mesh.PartitionCreateGhostCells", 1);
 
-    if (nParts > 1)
+    if (parallel_parts > 1)
     {
-        gmsh::model::mesh::partition(nParts);
+        gmsh::model::mesh::partition(parallel_parts);
     }
 
     // MSH 4.1 で出力

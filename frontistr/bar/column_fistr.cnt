@@ -5,19 +5,22 @@
 !WRITE,LOG,FREQUENCY=5000
 !WRITE,RESULT,FREQUENCY=5000
 !SOLUTION, TYPE=DYNAMIC
-!DYNAMIC, TYPE=LINEAR
+!DYNAMIC, TYPE=NONLINEAR
  1 , 1
- 0.0, 1.0, 32000, 0.000625
+ 0.0, 1.0, 2000, 0.01
  0.5, 0.25
  1, 1, 0.0, 0.0
- 100000, 1, 16
+ 100000, 1, 1
  1, 1, 1, 1, 1, 1
 ## Solver Control
 ### Boundary Condition
-!BOUNDARY AMP=AMP1
- FIX, 1, 0.0
- FIX, 2, 1.0
- FIX, 3, 0.0
+!BOUNDARY, GRPID=1, AMP=AMP1
+ FIX, 1, 1, 0.0
+ FIX, 2, 2, 1.0
+ FIX, 3, 3, 0.0
+### STEP
+!STEP
+ BOUNDARY, 1
 ### Material
 # define in mesh file
 ### Solver Setting
