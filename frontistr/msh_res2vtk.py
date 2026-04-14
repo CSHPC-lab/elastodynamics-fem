@@ -1,12 +1,11 @@
 """
-FrontISTR .msh + .res → VTK 変換スクリプト（変位のみ）
+FrontISTR .msh + .res → VTK 変換スクリプト（完全汎用・各成分の最大/最小トラッキング版）
 
 使い方:
   python3 msh_res2vtk.py work/column_fistr.msh work/column_fistr.res.0.*
 """
 
 import sys
-import os
 import glob
 import re
 
@@ -24,7 +23,6 @@ def read_msh(msh_path):
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-
         if line.startswith("!NODE"):
             section = "NODE"
             i += 1
@@ -41,8 +39,7 @@ def read_msh(msh_path):
         if section == "NODE" and line:
             parts = line.split(",")
             nid = int(parts[0])
-            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-            nodes[nid] = (x, y, z)
+            nodes[nid] = (float(parts[1]), float(parts[2]), float(parts[3]))
         elif section == "ELEMENT" and line:
             parts = line.split(",")
             eid = int(parts[0])
@@ -54,59 +51,115 @@ def read_msh(msh_path):
     return nodes, elements
 
 
-def read_res_disp(res_path):
-    """FrontISTR 結果ファイルから変位と時刻を読む"""
+def read_res_generic(res_path):
+    """ヘッダ情報を自動解析して全ての節点・要素データを読み込む"""
     with open(res_path, "r") as f:
-        lines = f.readlines()
 
-    # ヘッダからTOTALTIMEを取得
-    total_time = 0.0
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() == "TOTALTIME":
-            total_time = float(lines[i + 1].strip())
-            i += 2
-            continue
-        if lines[i].strip() == "*data":
-            i += 1
-            break
-        i += 1
+        def next_line():
+            for line in f:
+                s = line.strip()
+                if s:
+                    return s
+            return None
 
-    # n_nodes n_elems
-    parts = lines[i].split()
-    nn = int(parts[0])
-    i += 1
+        total_time = 0.0
+        line = next_line()
 
-    # n_ndata n_cdata
-    i += 1
+        # ヘッダ検索
+        while line is not None:
+            if line == "TOTALTIME":
+                total_time = float(next_line())
+            elif line == "*data":
+                break
+            line = next_line()
 
-    # component counts
-    parts = lines[i].split()
-    n_items = int(parts[0])
-    comp_counts = [int(p) for p in parts[1:]]
-    total_comps = sum(comp_counts)
-    i += 1
+        line = next_line()
+        if not line:
+            return total_time, [], []
 
-    # data names
-    for _ in range(n_items):
-        i += 1
+        # 節点数、要素数
+        nn, ne = map(int, line.split())
 
-    # 各節点のデータを読む
-    disp = {}
-    for _ in range(nn):
-        nid = int(lines[i].strip())
-        i += 1
-        all_vals = []
-        while len(all_vals) < total_comps:
-            all_vals.extend(float(v) for v in lines[i].split())
-            i += 1
-        disp[nid] = (all_vals[0], all_vals[1], all_vals[2])
+        # 節点データ数、要素データ数
+        n_ndata, n_cdata = map(int, next_line().split())
 
-    return total_time, disp
+        # 節点データ定義の読み取り
+        nodal_meta = []
+        if n_ndata > 0:
+            comps = list(map(int, next_line().split()))
+            for c in comps:
+                nodal_meta.append({"name": next_line(), "comp": c, "data": {}})
+
+        # 要素データ定義の読み取り
+        elem_meta = []
+        if n_cdata > 0:
+            comps = list(map(int, next_line().split()))
+            for c in comps:
+                elem_meta.append({"name": next_line(), "comp": c, "data": {}})
+
+        # 節点データの読み取り
+        if n_ndata > 0:
+            total_comps = sum(m["comp"] for m in nodal_meta)
+            for _ in range(nn):
+                nid = int(next_line())
+                vals = []
+                while len(vals) < total_comps:
+                    vals.extend(map(float, next_line().split()))
+
+                v_idx = 0
+                for m in nodal_meta:
+                    c = m["comp"]
+                    m["data"][nid] = vals[v_idx : v_idx + c]
+                    v_idx += c
+
+        # 要素データの読み取り
+        if n_cdata > 0:
+            total_comps = sum(m["comp"] for m in elem_meta)
+            for _ in range(ne):
+                eid = int(next_line())
+                vals = []
+                while len(vals) < total_comps:
+                    vals.extend(map(float, next_line().split()))
+
+                v_idx = 0
+                for m in elem_meta:
+                    c = m["comp"]
+                    m["data"][eid] = vals[v_idx : v_idx + c]
+                    v_idx += c
+
+    return total_time, nodal_meta, elem_meta
 
 
-def write_vtk(vtk_path, nodes, elements, disp, total_time):
-    """VTK Legacy 形式で書き出す（FIELD DATA に時刻を埋め込み）"""
+def write_vtk_field(f, meta, item_ids):
+    """VTKのデータ型を判別して書き出し"""
+    name = meta["name"].replace(" ", "_")
+    comp = meta["comp"]
+    data = meta["data"]
+
+    if comp == 1:
+        f.write(f"SCALARS {name} double 1\nLOOKUP_TABLE default\n")
+        for iid in item_ids:
+            f.write(f"{data.get(iid, [0.0])[0]:.10e}\n")
+    elif comp == 3:
+        f.write(f"VECTORS {name} double\n")
+        for iid in item_ids:
+            v = data.get(iid, [0.0] * 3)
+            f.write(f"{v[0]:.10e} {v[1]:.10e} {v[2]:.10e}\n")
+    elif comp == 6:
+        f.write(f"TENSORS {name} double\n")
+        for iid in item_ids:
+            v = data.get(iid, [0.0] * 6)
+            f.write(f"{v[0]:.10e} {v[3]:.10e} {v[5]:.10e}\n")
+            f.write(f"{v[3]:.10e} {v[1]:.10e} {v[4]:.10e}\n")
+            f.write(f"{v[5]:.10e} {v[4]:.10e} {v[2]:.10e}\n")
+    else:
+        f.write(f"SCALARS {name} double {comp}\nLOOKUP_TABLE default\n")
+        for iid in item_ids:
+            v = data.get(iid, [0.0] * comp)
+            f.write(" ".join(f"{x:.10e}" for x in v) + "\n")
+
+
+def write_vtk_generic(vtk_path, nodes, elements, nodal_meta, elem_meta, total_time):
     sorted_nids = sorted(nodes.keys())
     nid_to_idx = {nid: idx for idx, nid in enumerate(sorted_nids)}
     n_nodes = len(sorted_nids)
@@ -118,9 +171,8 @@ def write_vtk(vtk_path, nodes, elements, disp, total_time):
         f.write("ASCII\n")
         f.write("DATASET UNSTRUCTURED_GRID\n")
 
-        # --- 時刻を FIELD DATA として埋め込み ---
         f.write("\nFIELD FieldData 1\n")
-        f.write(f"TOTALTIME 1 1 double\n")
+        f.write("TOTALTIME 1 1 double\n")
         f.write(f"{total_time:.10e}\n")
 
         f.write(f"\nPOINTS {n_nodes} double\n")
@@ -128,7 +180,6 @@ def write_vtk(vtk_path, nodes, elements, disp, total_time):
             x, y, z = nodes[nid]
             f.write(f"{x:.10e} {y:.10e} {z:.10e}\n")
 
-        # 要素 (Tet10: FrontISTR→VTK で中間節点[8],[9]を入れ替え)
         total_ints = sum(len(conn) + 1 for _, conn in elements)
         f.write(f"\nCELLS {n_elems} {total_ints}\n")
         for eid, conn in elements:
@@ -140,33 +191,35 @@ def write_vtk(vtk_path, nodes, elements, disp, total_time):
         f.write(f"\nCELL_TYPES {n_elems}\n")
         for eid, conn in elements:
             nn = len(conn)
-            if nn == 10:
-                f.write("24\n")
-            elif nn == 4:
-                f.write("10\n")
-            elif nn == 8:
-                f.write("12\n")
-            elif nn == 20:
-                f.write("25\n")
-            else:
-                f.write("10\n")
+            f.write(
+                "24\n"
+                if nn == 10
+                else (
+                    "10\n"
+                    if nn == 4
+                    else "12\n" if nn == 8 else "25\n" if nn == 20 else "10\n"
+                )
+            )
 
-        # --- 節点ID → VTKインデックス対応表を埋め込み ---
-        f.write(f"\nPOINT_DATA {n_nodes}\n")
-        f.write("SCALARS NODE_ID int 1\n")
-        f.write("LOOKUP_TABLE default\n")
-        for nid in sorted_nids:
-            f.write(f"{nid}\n")
+        if nodal_meta:
+            f.write(f"\nPOINT_DATA {n_nodes}\n")
+            f.write("SCALARS NODE_ID int 1\nLOOKUP_TABLE default\n")
+            for nid in sorted_nids:
+                f.write(f"{nid}\n")
+            for m in nodal_meta:
+                write_vtk_field(f, m, sorted_nids)
 
-        f.write("VECTORS DISPLACEMENT double\n")
-        for nid in sorted_nids:
-            dx, dy, dz = disp.get(nid, (0, 0, 0))
-            f.write(f"{dx:.10e} {dy:.10e} {dz:.10e}\n")
+        if elem_meta:
+            f.write(f"\nCELL_DATA {n_elems}\n")
+            f.write("SCALARS ELEM_ID int 1\nLOOKUP_TABLE default\n")
+            for eid, _ in elements:
+                f.write(f"{eid}\n")
+            for m in elem_meta:
+                write_vtk_field(f, m, [e[0] for e in elements])
 
 
 def extract_step_number(filepath):
-    """ファイル名から数値ステップを抽出 (ソート用)"""
-    m = re.search(r'\.(\d+)$', filepath)
+    m = re.search(r"\.(\d+)$", filepath)
     return int(m.group(1)) if m else 0
 
 
@@ -179,7 +232,6 @@ if __name__ == "__main__":
     msh_path = sys.argv[1]
     res_args = sys.argv[2:]
 
-    # 結果ファイルのglob展開 + .vtk/.csv除外
     res_files = []
     for arg in res_args:
         expanded = glob.glob(arg)
@@ -194,13 +246,89 @@ if __name__ == "__main__":
     nodes, elements = read_msh(msh_path)
     print(f"  節点数: {len(nodes)}, 要素数: {len(elements)}")
 
+    # 6成分テンソル（応力・ひずみ等）の各成分ごとの最大・最小トラッカー
+    comp_trackers = {}
+    comp_names = ["XX", "YY", "ZZ", "XY", "YZ", "ZX"]
+
     for res_path in res_files:
-        total_time, disp = read_res_disp(res_path)
+        total_time, nodal_meta, elem_meta = read_res_generic(res_path)
 
         vtk_path = res_path + ".vtk"
-        write_vtk(vtk_path, nodes, elements, disp, total_time)
+        write_vtk_generic(vtk_path, nodes, elements, nodal_meta, elem_meta, total_time)
 
         step = extract_step_number(res_path)
         print(f"  step {step:4d}  t={total_time:8.4f}  → {vtk_path}")
 
+        # 出力された全ての変数から、成分数が6のもの（応力・ひずみ）を探して各成分を追跡
+        for m in nodal_meta + elem_meta:
+            if m["comp"] == 6:
+                name = m["name"]
+                if name not in comp_trackers:
+                    comp_trackers[name] = {
+                        c: {
+                            "max": -float("inf"),
+                            "max_info": None,
+                            "min": float("inf"),
+                            "min_info": None,
+                        }
+                        for c in comp_names
+                    }
+
+                for iid, s in m["data"].items():
+                    coords = nodes.get(iid, None)  # 節点なら座標を取得
+                    for i, c_name in enumerate(comp_names):
+                        val = s[i]
+                        # 最大値の更新（引張側）
+                        if val > comp_trackers[name][c_name]["max"]:
+                            comp_trackers[name][c_name]["max"] = val
+                            comp_trackers[name][c_name]["max_info"] = (
+                                step,
+                                total_time,
+                                iid,
+                                coords,
+                            )
+                        # 最小値の更新（圧縮側）
+                        if val < comp_trackers[name][c_name]["min"]:
+                            comp_trackers[name][c_name]["min"] = val
+                            comp_trackers[name][c_name]["min_info"] = (
+                                step,
+                                total_time,
+                                iid,
+                                coords,
+                            )
+
     print(f"\n完了: {len(res_files)} ファイル変換")
+
+    # 最大・最小値情報の出力
+    for name, tracker in comp_trackers.items():
+        print("\n" + "=" * 70)
+        print(f"【 {name} の各成分の最大・最小値 (全ステップ・全データ中) 】")
+        print("=" * 70)
+        for c_name in comp_names:
+            max_val = tracker[c_name]["max"]
+            max_info = tracker[c_name]["max_info"]
+            min_val = tracker[c_name]["min"]
+            min_info = tracker[c_name]["min_info"]
+
+            print(f"■ 成分 {c_name}")
+            if max_info:
+                step, t, iid, coords = max_info
+                coord_str = (
+                    f"X={coords[0]:.4f}, Y={coords[1]:.4f}, Z={coords[2]:.4f}"
+                    if coords
+                    else "N/A"
+                )
+                print(
+                    f"  [最大(引張)] {max_val: 13.6e} (Step: {step:3d}, ID: {iid}, 座標: {coord_str})"
+                )
+            if min_info:
+                step, t, iid, coords = min_info
+                coord_str = (
+                    f"X={coords[0]:.4f}, Y={coords[1]:.4f}, Z={coords[2]:.4f}"
+                    if coords
+                    else "N/A"
+                )
+                print(
+                    f"  [最小(圧縮)] {min_val: 13.6e} (Step: {step:3d}, ID: {iid}, 座標: {coord_str})"
+                )
+            print("-" * 70)
