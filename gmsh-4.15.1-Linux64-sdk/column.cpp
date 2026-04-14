@@ -5,10 +5,11 @@ export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 */
 #include <gmsh.h>
 #include <vector>
+#include <iostream>
 
 int main(int argc, char **argv)
 {
-    const double mesh_size = 0.5; // メッシュサイズの目安
+    const double mesh_size = 0.4; // メッシュサイズの目安
     const int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
 
     gmsh::initialize();
@@ -46,6 +47,7 @@ int main(int argc, char **argv)
     gmsh::option::setNumber("Mesh.SecondOrderLinear", 1);
 
     // 保存
+    std::cout << "start writing..." << std::endl;
     gmsh::write("column.vtk");
 
     // FrontISTR変換用に .msh (v2.2 ASCII) も出力
@@ -78,6 +80,7 @@ int main(int argc, char **argv)
     }
 
     // MSH 4.1 で出力
+    std::cout << "start writing partitioned mesh..." << std::endl;
     gmsh::option::setNumber("Mesh.MshFileVersion", 4.1);
     gmsh::write("column_4.msh");
 

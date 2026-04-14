@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_cusparse_mpi.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80
+nvcc main_cusparse_sell.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80
 mpirun -np 4 ./a.out
 */
 
@@ -16,6 +16,9 @@ mpirun -np 4 ./a.out
 #include <cuda_runtime.h>
 #include <cusparse.h>
 #include <cublas_v2.h>
+#include <algorithm>
+#include <numeric>
+#include <vector>
 
 // ============================================================
 // エラーチェックマクロ
@@ -59,6 +62,102 @@ mpirun -np 4 ./a.out
 static const int BLOCK_SIZE = 256;
 
 // ============================================================
+// Sliced ELLPACK (SELL-C-σ) パラメータ
+// ============================================================
+static const int SELL_C = 32;     // スライス幅（warpサイズに合わせる）
+static const int SELL_SIGMA = 32; // ソート範囲
+
+// ============================================================
+// SELL-C-σ 形式のCPUデータ
+// ============================================================
+struct SellCSigma
+{
+    int num_rows;
+    int num_slices;
+    int64_t total_padding;  // パディング込み総要素数 (= sellValuesSize)
+    int64_t *slice_offsets; // size: num_slices + 1
+    int *col_idx;           // size: total_padding
+    double *values;         // size: total_padding
+};
+
+// CSR → SELL-C-σ 変換 (CPU上で1回だけ実行)
+SellCSigma build_sell_from_csr(int num_rows, const int *csr_rp,
+                               const int *csr_ci, const double *csr_val)
+{
+    SellCSigma sell;
+    sell.num_rows = num_rows;
+    sell.num_slices = (num_rows + SELL_C - 1) / SELL_C;
+
+    // σブロック内でnnz降順にソート → 行の並び替え配列
+    std::vector<int> row_perm(num_rows);
+    std::iota(row_perm.begin(), row_perm.end(), 0);
+
+    for (int s = 0; s < sell.num_slices; s++)
+    {
+        int start = s * SELL_C;
+        int end = std::min(start + SELL_SIGMA, num_rows);
+        std::sort(row_perm.begin() + start, row_perm.begin() + end,
+                  [&](int a, int b)
+                  { return (csr_rp[a + 1] - csr_rp[a]) > (csr_rp[b + 1] - csr_rp[b]); });
+    }
+
+    // slice_offsets の計算
+    sell.slice_offsets = new int64_t[sell.num_slices + 1];
+    sell.slice_offsets[0] = 0;
+    for (int s = 0; s < sell.num_slices; s++)
+    {
+        int start = s * SELL_C;
+        int max_nnz = 0;
+        for (int i = start; i < std::min(start + SELL_C, num_rows); i++)
+        {
+            int row = row_perm[i];
+            max_nnz = std::max(max_nnz, csr_rp[row + 1] - csr_rp[row]);
+        }
+        sell.slice_offsets[s + 1] = sell.slice_offsets[s] + (int64_t)max_nnz * SELL_C;
+    }
+    sell.total_padding = sell.slice_offsets[sell.num_slices];
+
+    // col_idx, values の確保・充填
+    sell.col_idx = new int[sell.total_padding];
+    sell.values = new double[sell.total_padding];
+    std::fill(sell.col_idx, sell.col_idx + sell.total_padding, 0);
+    std::fill(sell.values, sell.values + sell.total_padding, 0.0);
+
+#pragma omp parallel for
+    for (int s = 0; s < sell.num_slices; s++)
+    {
+        int slice_start = s * SELL_C;
+        int64_t slice_offset = sell.slice_offsets[s];
+
+        for (int lane = 0; lane < SELL_C; lane++)
+        {
+            int global_row = slice_start + lane;
+            if (global_row >= num_rows)
+                break;
+
+            int row = row_perm[global_row];
+            int row_nnz = csr_rp[row + 1] - csr_rp[row];
+
+            for (int k = 0; k < row_nnz; k++)
+            {
+                int64_t idx = slice_offset + (int64_t)k * SELL_C + lane;
+                sell.col_idx[idx] = csr_ci[csr_rp[row] + k];
+                sell.values[idx] = csr_val[csr_rp[row] + k];
+            }
+        }
+    }
+
+    return sell;
+}
+
+void free_sell(SellCSigma &sell)
+{
+    delete[] sell.slice_offsets;
+    delete[] sell.col_idx;
+    delete[] sell.values;
+}
+
+// ============================================================
 // CPU側の関数宣言（手書き版と同一）
 // ============================================================
 void calculate_dN(double dN[30], double r, double s, double t);
@@ -93,8 +192,6 @@ void write_node_disp_csv(const char *fn, double *u, int ns, int sf, double dt);
 // ============================================================
 // BCRS → スカラーCSR 変換 (CPU上で1回だけ実行)
 // ============================================================
-// K: 各3×3ブロック → 9エントリ   nnz_scalar = 9 * nnz_bcrs
-// M: 各ブロックは m*I → 3エントリ nnz_scalar = 3 * nnz_bcrs
 void build_scalar_csr_K(
     int num_nodes, int nnz_bcrs,
     const int *brp, const int *bci,
@@ -103,17 +200,12 @@ void build_scalar_csr_K(
     const double *k20, const double *k21, const double *k22,
     int *csr_rp, int *csr_ci, double *csr_val)
 {
-    // csr_rp: size 3*num_nodes + 1
-    // csr_ci, csr_val: size 9*nnz_bcrs
     int N3 = 3 * num_nodes;
-
-    // 各スカラー行の非ゼロ数を計算
-    // ブロック行 i → スカラー行 3i, 3i+1, 3i+2 それぞれ 3*nnz_in_block_row 個
     for (int i = 0; i <= N3; i++)
         csr_rp[i] = 0;
     for (int i = 0; i < num_nodes; i++)
     {
-        int bnnz = brp[i + 1] - brp[i]; // ブロック行iの非ゼロブロック数
+        int bnnz = brp[i + 1] - brp[i];
         csr_rp[3 * i + 1] = 3 * bnnz;
         csr_rp[3 * i + 2] = 3 * bnnz;
         csr_rp[3 * i + 3] = 3 * bnnz;
@@ -121,10 +213,8 @@ void build_scalar_csr_K(
     for (int i = 1; i <= N3; i++)
         csr_rp[i] += csr_rp[i - 1];
 
-    // 値を埋める
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
-    {
         for (int r = 0; r < 3; r++)
         {
             int scalar_row = 3 * i + r;
@@ -135,7 +225,6 @@ void build_scalar_csr_K(
                 for (int c = 0; c < 3; c++)
                 {
                     csr_ci[write_pos] = 3 * j + c;
-                    // kval[r][c] at block position bp
                     double v = 0.0;
                     if (r == 0 && c == 0)
                         v = k00[bp];
@@ -160,18 +249,13 @@ void build_scalar_csr_K(
                 }
             }
         }
-    }
 }
 
 void build_scalar_csr_M(
     int num_nodes, int nnz_bcrs,
-    const int *brp, const int *bci,
-    const double *mval,
+    const int *brp, const int *bci, const double *mval,
     int *csr_rp, int *csr_ci, double *csr_val)
 {
-    // M の各ブロック (i,j) は mval[bp] * I_3
-    // スカラー行 3i+r には列 3j+r にだけ非ゼロ (r=0,1,2)
-    // 各スカラー行の非ゼロ数 = ブロック行の非ゼロブロック数
     int N3 = 3 * num_nodes;
     for (int i = 0; i <= N3; i++)
         csr_rp[i] = 0;
@@ -187,7 +271,6 @@ void build_scalar_csr_M(
 
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
-    {
         for (int r = 0; r < 3; r++)
         {
             int scalar_row = 3 * i + r;
@@ -200,14 +283,12 @@ void build_scalar_csr_M(
                 write_pos++;
             }
         }
-    }
 }
 
 // ============================================================
-// CUDAカーネル（ライブラリで置き換えられない問題固有の処理）
+// CUDAカーネル（問題固有の処理）
 // ============================================================
 
-// Newmark-β RHS一時ベクトル: インターリーブ、成分独立なので3N並列
 __global__ void kernel_build_newmark_tmp(
     int n3, double dt_inv2, double dt_inv,
     const double *u, const double *v, const double *a, double *tmp)
@@ -218,7 +299,6 @@ __global__ void kernel_build_newmark_tmp(
     tmp[i] = u[i] * 4.0 * dt_inv2 + v[i] * 4.0 * dt_inv + a[i];
 }
 
-// 境界条件RHS補正（自由節点）: bc_corrはSoA、rhsはインターリーブ
 __global__ void kernel_apply_bc_corr(
     int num_nodes, const double *bc_val,
     const double *c00, const double *c01, const double *c02,
@@ -235,7 +315,6 @@ __global__ void kernel_apply_bc_corr(
     rhs[3 * i + 2] -= c20[i] * bv0 + c21[i] * bv1 + c22[i] * bv2;
 }
 
-// 境界条件RHS設定（拘束節点）
 __global__ void kernel_apply_bc_constrained(
     int num_nodes, const int *bc_flag, const double *bc_val, double *rhs)
 {
@@ -250,7 +329,6 @@ __global__ void kernel_apply_bc_constrained(
     }
 }
 
-// ブロックヤコビ前処理: z = C^{-1} r (inv_diagはSoA、r/zはインターリーブ)
 __global__ void kernel_block_jacobi_precond(
     int num_owned,
     const double *inv00, const double *inv01, const double *inv02,
@@ -267,7 +345,6 @@ __global__ void kernel_block_jacobi_precond(
     z[3 * i + 2] = inv20[i] * r0 + inv21[i] * r1 + inv22[i] * r2;
 }
 
-// Newmark-β更新
 __global__ void kernel_newmark_update(
     int num_nodes, double dt, double dt_inv, double dt_inv2,
     const int *bc_flag,
@@ -277,19 +354,16 @@ __global__ void kernel_newmark_update(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_nodes)
         return;
-
     double un0 = u[3 * i], un1 = u[3 * i + 1], un2 = u[3 * i + 2];
     double uo0 = u_prv[3 * i], uo1 = u_prv[3 * i + 1], uo2 = u_prv[3 * i + 2];
     double vo0 = v[3 * i], vo1 = v[3 * i + 1], vo2 = v[3 * i + 2];
     double ao0 = a[3 * i], ao1 = a[3 * i + 1], ao2 = a[3 * i + 2];
-
     double an0 = (un0 - uo0) * 4.0 * dt_inv2 - vo0 * 4.0 * dt_inv - ao0;
     double an1 = (un1 - uo1) * 4.0 * dt_inv2 - vo1 * 4.0 * dt_inv - ao1;
     double an2 = (un2 - uo2) * 4.0 * dt_inv2 - vo2 * 4.0 * dt_inv - ao2;
     double vn0 = vo0 + (an0 + ao0) * dt / 2.0;
     double vn1 = vo1 + (an1 + ao1) * dt / 2.0;
     double vn2 = vo2 + (an2 + ao2) * dt / 2.0;
-
     if (bc_flag[i])
     {
         un0 = bc_val_u[0];
@@ -302,7 +376,6 @@ __global__ void kernel_newmark_update(
         an1 = bc_val_a[1];
         an2 = bc_val_a[2];
     }
-
     u_prv[3 * i] = un0;
     u_prv[3 * i + 1] = un1;
     u_prv[3 * i + 2] = un2;
@@ -314,7 +387,6 @@ __global__ void kernel_newmark_update(
     a[3 * i + 2] = an2;
 }
 
-// MPI送信バッファパック（インターリーブ）
 __global__ void kernel_pack_send(
     int count, int offset, const int *send_nodes,
     const double *vec, double *sbuf)
@@ -354,32 +426,36 @@ T *d_alloc_zero(int n)
     CUDA_CHECK(cudaMemset(p, 0, n * sizeof(T)));
     return p;
 }
+// int64_t サイズ版
+template <typename T>
+T *d_alloc_copy_i64(const T *h, int64_t n)
+{
+    T *p;
+    CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
+    CUDA_CHECK(cudaMemcpy(p, h, n * sizeof(T), cudaMemcpyHostToDevice));
+    return p;
+}
 
 #define GRID(n) (((n) + BLOCK_SIZE - 1) / BLOCK_SIZE)
 
 // ============================================================
 // PCGソルバー (cuSPARSE / cuBLAS 版)
+// ※ cusparseSpMatDescr_t はCSRでもSELLでも同じSpMV APIで動く
 // ============================================================
-// ※ 通信と計算のオーバーラップは行わない（ライブラリ版の制約）
 int pcg_solve_cusparse(
-    cusparseHandle_t cusparse_h,
-    cublasHandle_t cublas_h,
+    cusparseHandle_t cusparse_h, cublasHandle_t cublas_h,
     cusparseSpMatDescr_t K_descr,
     cusparseDnVecDescr_t vecX_descr, cusparseDnVecDescr_t vecY_descr,
     void *spmv_buffer,
-    // MPI
     MPI_Request *request,
     int num_neighbors, int *neighbor_ranks,
     int *recv_starts, int *recv_counts,
     int *send_starts, int *send_counts,
     int *d_send_nodes, double *d_send_buf,
-    // サイズ
     int num_inner, int num_owned, int num_nodes,
-    // 前処理
     double *d_inv00, double *d_inv01, double *d_inv02,
     double *d_inv10, double *d_inv11, double *d_inv12,
     double *d_inv20, double *d_inv21, double *d_inv22,
-    // ベクトル（インターリーブ, size 3*num_nodes）
     double *d_b, double *d_x, double *d_r, double *d_z, double *d_p, double *d_Ap,
     double tol, int max_iter)
 {
@@ -387,33 +463,24 @@ int pcg_solve_cusparse(
     int owned3 = 3 * num_owned;
     double alpha_sp = 1.0, beta_sp = 0.0, neg_one = -1.0, one = 1.0;
 
-    // --- r = b - K*x ---
-    // Ap = K * x
+    // r = b - K*x
     cusparseDnVecSetValues(vecX_descr, d_x);
     cusparseDnVecSetValues(vecY_descr, d_Ap);
     CUSPARSE_CHECK(cusparseSpMV(cusparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                 &alpha_sp, K_descr, vecX_descr, &beta_sp, vecY_descr,
                                 CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, spmv_buffer));
-
-    // r = b
     CUDA_CHECK(cudaMemcpy(d_r, d_b, owned3 * sizeof(double), cudaMemcpyDeviceToDevice));
-    // r -= Ap  (owned部分のみ)
     CUBLAS_CHECK(cublasDaxpy(cublas_h, owned3, &neg_one, d_Ap, 1, d_r, 1));
 
-    // z = C^{-1} r
     kernel_block_jacobi_precond<<<GRID(num_owned), BLOCK_SIZE>>>(
         num_owned, d_inv00, d_inv01, d_inv02, d_inv10, d_inv11, d_inv12,
         d_inv20, d_inv21, d_inv22, d_r, d_z);
-
-    // p = z (owned部分)
     CUDA_CHECK(cudaMemcpy(d_p, d_z, owned3 * sizeof(double), cudaMemcpyDeviceToDevice));
 
-    // rz = r · z, b_norm = b · b, r_norm = r · r  (owned部分)
     double rz, b_norm, r_norm;
     CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_r, 1, d_z, 1, &rz));
     CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_b, 1, d_b, 1, &b_norm));
     CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_r, 1, d_r, 1, &r_norm));
-
     MPI_Allreduce(MPI_IN_PLACE, &rz, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &b_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -426,76 +493,52 @@ int pcg_solve_cusparse(
     int iter;
     for (iter = 0; iter < max_iter; iter++)
     {
-        // --- ゴースト節点通信 (p) ---
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n], sc = send_counts[n];
             if (sc > 0)
-            {
-                kernel_pack_send<<<GRID(sc), BLOCK_SIZE>>>(
-                    sc, ss, d_send_nodes, d_p, d_send_buf);
-            }
+                kernel_pack_send<<<GRID(sc), BLOCK_SIZE>>>(sc, ss, d_send_nodes, d_p, d_send_buf);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
-
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n], sc = send_counts[n];
-            // 送受信: インターリーブなので3倍のデータ量、1回のsend/recvで済む
-            MPI_Isend(&d_send_buf[3 * ss], 3 * sc, MPI_DOUBLE,
-                      neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            MPI_Irecv(&d_p[3 * recv_starts[n]], 3 * recv_counts[n], MPI_DOUBLE,
-                      neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
+            MPI_Isend(&d_send_buf[3 * ss], 3 * sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+            MPI_Irecv(&d_p[3 * recv_starts[n]], 3 * recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
         }
         MPI_Waitall(2 * num_neighbors, request, MPI_STATUSES_IGNORE);
 
-        // --- Ap = K * p （通信完了後に全体SpMV） ---
+        // Ap = K * p (cuSPARSE SpMV — SELL形式でもCSR形式でも同じAPI)
         cusparseDnVecSetValues(vecX_descr, d_p);
         cusparseDnVecSetValues(vecY_descr, d_Ap);
         CUSPARSE_CHECK(cusparseSpMV(cusparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     &alpha_sp, K_descr, vecX_descr, &beta_sp, vecY_descr,
                                     CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, spmv_buffer));
 
-        // pAp = p · Ap (owned部分)
         double pAp;
         CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_p, 1, d_Ap, 1, &pAp));
         MPI_Allreduce(MPI_IN_PLACE, &pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
         double alpha = rz / pAp;
-
-        // x += alpha * p (全節点)
         CUBLAS_CHECK(cublasDaxpy(cublas_h, N3, &alpha, d_p, 1, d_x, 1));
-
-        // r -= alpha * Ap (owned部分)
         double neg_alpha = -alpha;
         CUBLAS_CHECK(cublasDaxpy(cublas_h, owned3, &neg_alpha, d_Ap, 1, d_r, 1));
-
-        // r_norm (owned部分)
         CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_r, 1, d_r, 1, &r_norm));
         MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
         if (r_norm / b_norm < tol * tol)
         {
             iter++;
             break;
         }
 
-        // z = C^{-1} r
         kernel_block_jacobi_precond<<<GRID(num_owned), BLOCK_SIZE>>>(
             num_owned, d_inv00, d_inv01, d_inv02, d_inv10, d_inv11, d_inv12,
             d_inv20, d_inv21, d_inv22, d_r, d_z);
-
-        // rz_new = r · z (owned部分)
         double rz_new;
         CUBLAS_CHECK(cublasDdot(cublas_h, owned3, d_r, 1, d_z, 1, &rz_new));
         MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
         double beta = rz_new / rz;
-
-        // p = z + beta * p  → p *= beta; p += z (owned部分)
         CUBLAS_CHECK(cublasDscal(cublas_h, owned3, &beta, d_p, 1));
         CUBLAS_CHECK(cublasDaxpy(cublas_h, owned3, &one, d_z, 1, d_p, 1));
-
         rz = rz_new;
     }
     return iter;
@@ -568,7 +611,7 @@ int main(int argc, char *argv[])
     send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
     int total_send = send_starts[num_neighbors];
 
-    // --- CPU上で行列構築（手書き版と同一） ---
+    // --- CPU上で行列構築 ---
     double dN0[30] = {}, dN1[30] = {}, dN2[30] = {}, dN3_[30] = {};
     double *kmat_coo_val = new double[100 * num_elements * 9]();
     double *mmat_coo_val = new double[100 * num_elements]();
@@ -601,7 +644,7 @@ int main(int argc, char *argv[])
     delete[] mmat_coo_val;
     std::cout << "Number of non-zero blocks in bcrs: " << nnz_bcrs << std::endl;
 
-    // 境界条件（CPU上）
+    // 境界条件
     int *bc_flag = new int[num_nodes]();
     double *bc_corr_00 = new double[num_nodes](), *bc_corr_01 = new double[num_nodes](), *bc_corr_02 = new double[num_nodes]();
     double *bc_corr_10 = new double[num_nodes](), *bc_corr_11 = new double[num_nodes](), *bc_corr_12 = new double[num_nodes]();
@@ -615,7 +658,7 @@ int main(int argc, char *argv[])
         if (node_coords[i * 3 + 2] < 1e-6)
             bc_flag[i] = 1;
 
-    // M用のスカラーCSRはBC適用前に構築（質量行列はBCの影響を受けない）
+    // M用スカラーCSR（BC適用前）
     int nnz_M_scalar = 3 * nnz_bcrs;
     int *M_rp = new int[N3 + 1];
     int *M_ci = new int[nnz_M_scalar];
@@ -629,7 +672,7 @@ int main(int argc, char *argv[])
     build_block_jacobi(num_nodes, brp, bci, bk00, bk01, bk02, bk10, bk11, bk12, bk20, bk21, bk22,
                        inv00, inv01, inv02, inv10, inv11, inv12, inv20, inv21, inv22);
 
-    // K用のスカラーCSR（BC適用後）
+    // K用スカラーCSR（BC適用後）
     int nnz_K_scalar = 9 * nnz_bcrs;
     int *K_rp = new int[N3 + 1];
     int *K_ci = new int[nnz_K_scalar];
@@ -642,55 +685,62 @@ int main(int argc, char *argv[])
     printf("Scalar CSR M: rows=%d, nnz=%d\n", N3, nnz_M_scalar);
 
     // ============================================================
+    // CSR → SELL-C-σ 変換
+    // ============================================================
+    double sell_build_start = MPI_Wtime();
+    SellCSigma K_sell = build_sell_from_csr(N3, K_rp, K_ci, K_val);
+    SellCSigma M_sell = build_sell_from_csr(N3, M_rp, M_ci, M_val);
+    double sell_build_end = MPI_Wtime();
+    printf("SELL-C-%d (sigma=%d) build time: %.4f seconds\n", SELL_C, SELL_SIGMA, sell_build_end - sell_build_start);
+    printf("SELL K: rows=%d, slices=%d, padded_nnz=%ld (overhead=%.1f%%)\n",
+           K_sell.num_rows, K_sell.num_slices, (long)K_sell.total_padding,
+           100.0 * (K_sell.total_padding - nnz_K_scalar) / nnz_K_scalar);
+    printf("SELL M: rows=%d, slices=%d, padded_nnz=%ld (overhead=%.1f%%)\n",
+           M_sell.num_rows, M_sell.num_slices, (long)M_sell.total_padding,
+           100.0 * (M_sell.total_padding - nnz_M_scalar) / nnz_M_scalar);
+
+    // CSRのCPUメモリは不要
+    delete[] K_rp;
+    delete[] K_ci;
+    delete[] K_val;
+    delete[] M_rp;
+    delete[] M_ci;
+    delete[] M_val;
+
+    // ============================================================
     // GPUへ転送
     // ============================================================
     double xfer_start = MPI_Wtime();
 
-    // スカラーCSR行列
-    int *d_K_rp = d_alloc_copy(K_rp, N3 + 1);
-    int *d_K_ci = d_alloc_copy(K_ci, nnz_K_scalar);
-    double *d_K_val = d_alloc_copy(K_val, nnz_K_scalar);
-    int *d_M_rp = d_alloc_copy(M_rp, N3 + 1);
-    int *d_M_ci = d_alloc_copy(M_ci, nnz_M_scalar);
-    double *d_M_val = d_alloc_copy(M_val, nnz_M_scalar);
+    // SELL行列データ
+    int64_t *d_K_slice_offsets = d_alloc_copy_i64(K_sell.slice_offsets, (int64_t)(K_sell.num_slices + 1));
+    int *d_K_col_idx = d_alloc_copy_i64(K_sell.col_idx, K_sell.total_padding);
+    double *d_K_values = d_alloc_copy_i64(K_sell.values, K_sell.total_padding);
+    int64_t *d_M_slice_offsets = d_alloc_copy_i64(M_sell.slice_offsets, (int64_t)(M_sell.num_slices + 1));
+    int *d_M_col_idx = d_alloc_copy_i64(M_sell.col_idx, M_sell.total_padding);
+    double *d_M_values = d_alloc_copy_i64(M_sell.values, M_sell.total_padding);
 
     // 境界条件
     int *d_bc_flag = d_alloc_copy(bc_flag, num_nodes);
-    double *d_bc_corr_00 = d_alloc_copy(bc_corr_00, num_nodes);
-    double *d_bc_corr_01 = d_alloc_copy(bc_corr_01, num_nodes);
-    double *d_bc_corr_02 = d_alloc_copy(bc_corr_02, num_nodes);
-    double *d_bc_corr_10 = d_alloc_copy(bc_corr_10, num_nodes);
-    double *d_bc_corr_11 = d_alloc_copy(bc_corr_11, num_nodes);
-    double *d_bc_corr_12 = d_alloc_copy(bc_corr_12, num_nodes);
-    double *d_bc_corr_20 = d_alloc_copy(bc_corr_20, num_nodes);
-    double *d_bc_corr_21 = d_alloc_copy(bc_corr_21, num_nodes);
-    double *d_bc_corr_22 = d_alloc_copy(bc_corr_22, num_nodes);
+    double *d_bc_corr_00 = d_alloc_copy(bc_corr_00, num_nodes), *d_bc_corr_01 = d_alloc_copy(bc_corr_01, num_nodes), *d_bc_corr_02 = d_alloc_copy(bc_corr_02, num_nodes);
+    double *d_bc_corr_10 = d_alloc_copy(bc_corr_10, num_nodes), *d_bc_corr_11 = d_alloc_copy(bc_corr_11, num_nodes), *d_bc_corr_12 = d_alloc_copy(bc_corr_12, num_nodes);
+    double *d_bc_corr_20 = d_alloc_copy(bc_corr_20, num_nodes), *d_bc_corr_21 = d_alloc_copy(bc_corr_21, num_nodes), *d_bc_corr_22 = d_alloc_copy(bc_corr_22, num_nodes);
 
     // 前処理
     double *d_inv00 = d_alloc_copy(inv00, num_nodes), *d_inv01 = d_alloc_copy(inv01, num_nodes), *d_inv02 = d_alloc_copy(inv02, num_nodes);
     double *d_inv10 = d_alloc_copy(inv10, num_nodes), *d_inv11 = d_alloc_copy(inv11, num_nodes), *d_inv12 = d_alloc_copy(inv12, num_nodes);
     double *d_inv20 = d_alloc_copy(inv20, num_nodes), *d_inv21 = d_alloc_copy(inv21, num_nodes), *d_inv22 = d_alloc_copy(inv22, num_nodes);
 
-    // ベクトル（インターリーブ, size 3*num_nodes）
-    double *d_u = d_alloc_zero<double>(N3);    // 変位
-    double *d_v = d_alloc_zero<double>(N3);    // 速度
-    double *d_a = d_alloc_zero<double>(N3);    // 加速度
-    double *d_uprv = d_alloc_zero<double>(N3); // 前ステップ変位
-    double *d_rhs = d_alloc_zero<double>(N3);  // 右辺
-    double *d_tmp = d_alloc_zero<double>(N3);  // 一時
-    double *d_r = d_alloc_zero<double>(N3);    // PCG残差
-    double *d_z = d_alloc_zero<double>(N3);
-    double *d_p = d_alloc_zero<double>(N3);
-    double *d_Ap = d_alloc_zero<double>(N3);
-
-    // 境界条件の値
-    double *d_bc_val_u = d_alloc_zero<double>(3);
-    double *d_bc_val_v = d_alloc_zero<double>(3);
-    double *d_bc_val_a = d_alloc_zero<double>(3);
+    // ベクトル
+    double *d_u = d_alloc_zero<double>(N3), *d_v = d_alloc_zero<double>(N3), *d_a = d_alloc_zero<double>(N3);
+    double *d_uprv = d_alloc_zero<double>(N3), *d_rhs = d_alloc_zero<double>(N3), *d_tmp = d_alloc_zero<double>(N3);
+    double *d_r = d_alloc_zero<double>(N3), *d_z = d_alloc_zero<double>(N3);
+    double *d_p = d_alloc_zero<double>(N3), *d_Ap = d_alloc_zero<double>(N3);
+    double *d_bc_val_u = d_alloc_zero<double>(3), *d_bc_val_v = d_alloc_zero<double>(3), *d_bc_val_a = d_alloc_zero<double>(3);
 
     // MPI通信
     int *d_send_nodes = d_alloc_copy(send_nodes_vec.data(), total_send);
-    double *d_send_buf = d_alloc_zero<double>(3 * total_send); // インターリーブ
+    double *d_send_buf = d_alloc_zero<double>(3 * total_send);
 
     CUDA_CHECK(cudaDeviceSynchronize());
     double xfer_end = MPI_Wtime();
@@ -704,26 +754,38 @@ int main(int argc, char *argv[])
     CUSPARSE_CHECK(cusparseCreate(&cusparse_h));
     CUBLAS_CHECK(cublasCreate(&cublas_h));
 
-    // K行列ディスクリプタ
+    // ============================================================
+    // K行列ディスクリプタ — Sliced ELLPACK (cusparseCreateSlicedEll)
+    // ============================================================
     cusparseSpMatDescr_t K_descr;
-    CUSPARSE_CHECK(cusparseCreateCsr(&K_descr, N3, N3, nnz_K_scalar,
-                                     d_K_rp, d_K_ci, d_K_val,
-                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    CUSPARSE_CHECK(cusparseCreateSlicedEll(
+        &K_descr,
+        (int64_t)N3, (int64_t)N3, (int64_t)nnz_K_scalar,
+        K_sell.total_padding, (int64_t)SELL_C,
+        d_K_slice_offsets, d_K_col_idx, d_K_values,
+        CUSPARSE_INDEX_64I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
-    // M行列ディスクリプタ
+    // M行列ディスクリプタ — Sliced ELLPACK
     cusparseSpMatDescr_t M_descr;
-    CUSPARSE_CHECK(cusparseCreateCsr(&M_descr, N3, N3, nnz_M_scalar,
-                                     d_M_rp, d_M_ci, d_M_val,
-                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+    CUSPARSE_CHECK(cusparseCreateSlicedEll(
+        &M_descr,
+        (int64_t)N3, (int64_t)N3, (int64_t)nnz_M_scalar,
+        M_sell.total_padding, (int64_t)SELL_C,
+        d_M_slice_offsets, d_M_col_idx, d_M_values,
+        CUSPARSE_INDEX_64I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
-    // 密ベクトルディスクリプタ（ポインタは後で更新可能）
+    // CPU側SELLデータを解放
+    free_sell(K_sell);
+    free_sell(M_sell);
+
+    // 密ベクトルディスクリプタ
     cusparseDnVecDescr_t vecX_descr, vecY_descr;
     CUSPARSE_CHECK(cusparseCreateDnVec(&vecX_descr, N3, d_tmp, CUDA_R_64F));
     CUSPARSE_CHECK(cusparseCreateDnVec(&vecY_descr, N3, d_rhs, CUDA_R_64F));
 
-    // SpMVバッファ確保 (K用)
+    // SpMVバッファ確保
     double alpha_sp = 1.0, beta_sp = 0.0;
     size_t K_buf_size = 0, M_buf_size = 0;
     CUSPARSE_CHECK(cusparseSpMV_bufferSize(cusparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
@@ -735,8 +797,7 @@ int main(int argc, char *argv[])
     size_t buf_size = (K_buf_size > M_buf_size) ? K_buf_size : M_buf_size;
     void *d_spmv_buffer;
     CUDA_CHECK(cudaMalloc(&d_spmv_buffer, buf_size));
-
-    printf("cuSPARSE SpMV buffer size: %zu bytes\n", buf_size);
+    printf("cuSPARSE SpMV buffer size (SELL): %zu bytes\n", buf_size);
 
     // ============================================================
     // タイムステップループ
@@ -761,18 +822,15 @@ int main(int argc, char *argv[])
         CUDA_CHECK(cudaMemcpy(d_bc_val_v, h_bc_val_v, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_bc_val_a, h_bc_val_a, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
-        // tmp = 4/dt^2 * u + 4/dt * v + a (インターリーブ, 成分独立)
-        kernel_build_newmark_tmp<<<GRID(N3), BLOCK_SIZE>>>(
-            N3, dt_inv2, dt_inv, d_u, d_v, d_a, d_tmp);
+        kernel_build_newmark_tmp<<<GRID(N3), BLOCK_SIZE>>>(N3, dt_inv2, dt_inv, d_u, d_v, d_a, d_tmp);
 
-        // rhs = M * tmp (cuSPARSE)
+        // rhs = M * tmp (cuSPARSE SpMV — SELL形式)
         cusparseDnVecSetValues(vecX_descr, d_tmp);
         cusparseDnVecSetValues(vecY_descr, d_rhs);
         CUSPARSE_CHECK(cusparseSpMV(cusparse_h, CUSPARSE_OPERATION_NON_TRANSPOSE,
                                     &alpha_sp, M_descr, vecX_descr, &beta_sp, vecY_descr,
                                     CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, d_spmv_buffer));
 
-        // 外力
         if (force_node >= 0)
         {
             int idx = 3 * force_node + force_dof;
@@ -782,17 +840,14 @@ int main(int argc, char *argv[])
             CUDA_CHECK(cudaMemcpy(&d_rhs[idx], &h_val, sizeof(double), cudaMemcpyHostToDevice));
         }
 
-        // BC適用
         kernel_apply_bc_corr<<<GRID(num_nodes), BLOCK_SIZE>>>(
             num_nodes, d_bc_val_u,
             d_bc_corr_00, d_bc_corr_01, d_bc_corr_02,
             d_bc_corr_10, d_bc_corr_11, d_bc_corr_12,
             d_bc_corr_20, d_bc_corr_21, d_bc_corr_22, d_rhs);
-        kernel_apply_bc_constrained<<<GRID(num_nodes), BLOCK_SIZE>>>(
-            num_nodes, d_bc_flag, d_bc_val_u, d_rhs);
+        kernel_apply_bc_constrained<<<GRID(num_nodes), BLOCK_SIZE>>>(num_nodes, d_bc_flag, d_bc_val_u, d_rhs);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // PCGソルバー
         int iter = pcg_solve_cusparse(
             cusparse_h, cublas_h, K_descr, vecX_descr, vecY_descr, d_spmv_buffer,
             requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts,
@@ -804,18 +859,13 @@ int main(int argc, char *argv[])
         if (rank == 0)
             std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
 
-        // Newmark-β更新
         kernel_newmark_update<<<GRID(num_nodes), BLOCK_SIZE>>>(
             num_nodes, dt, dt_inv, dt_inv2,
             d_bc_flag, d_bc_val_u, d_bc_val_v, d_bc_val_a,
             d_u, d_uprv, d_v, d_a);
 
-        // サンプリング
         if (step % sample_freq == 0 && target_node >= 0)
-        {
-            CUDA_CHECK(cudaMemcpy(&u_record[(step / sample_freq) * 3],
-                                  &d_u[3 * target_node], 3 * sizeof(double), cudaMemcpyDeviceToHost));
-        }
+            CUDA_CHECK(cudaMemcpy(&u_record[(step / sample_freq) * 3], &d_u[3 * target_node], 3 * sizeof(double), cudaMemcpyDeviceToHost));
     }
 
     // ============================================================
@@ -847,12 +897,12 @@ int main(int argc, char *argv[])
     cusparseDestroy(cusparse_h);
     cublasDestroy(cublas_h);
     cudaFree(d_spmv_buffer);
-    cudaFree(d_K_rp);
-    cudaFree(d_K_ci);
-    cudaFree(d_K_val);
-    cudaFree(d_M_rp);
-    cudaFree(d_M_ci);
-    cudaFree(d_M_val);
+    cudaFree(d_K_slice_offsets);
+    cudaFree(d_K_col_idx);
+    cudaFree(d_K_values);
+    cudaFree(d_M_slice_offsets);
+    cudaFree(d_M_col_idx);
+    cudaFree(d_M_values);
     cudaFree(d_bc_flag);
     cudaFree(d_bc_corr_00);
     cudaFree(d_bc_corr_01);
@@ -888,12 +938,6 @@ int main(int argc, char *argv[])
     cudaFree(d_send_nodes);
     cudaFree(d_send_buf);
 
-    delete[] K_rp;
-    delete[] K_ci;
-    delete[] K_val;
-    delete[] M_rp;
-    delete[] M_ci;
-    delete[] M_val;
     delete[] bk00;
     delete[] bk01;
     delete[] bk02;

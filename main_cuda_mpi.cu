@@ -493,43 +493,42 @@ __global__ void kernel_spmv(
     int warp_id = tid / 32;
     int lane_id = tid % 32;
 
-    // 1つのWarp（32スレッド）が、1つの行（i）を担当する
+    // 1つのWarpが、1つの行を担当する
     int i = start + warp_id;
+
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
 
     if (i < end)
     {
-        double s0 = 0.0, s1 = 0.0, s2 = 0.0;
-
         int row_start = row_ptr[i];
         int row_end = row_ptr[i + 1];
 
-        // Warp内の32スレッドが協調して隣接する要素を読み込む（ここでコアレスアクセスになる）
+        // col_ind,kvalへのコアレスアクセスのため、連続するThreadが連続するpを処理するようにループする
         for (int p = row_start + lane_id; p < row_end; p += 32)
         {
             int j = col_ind[p];
             double px = p0[j], py = p1[j], pz = p2[j];
 
-            // pがスレッド間で連番になるため、各kval配列へのアクセスも自動的にコアレス化される
             s0 += kval_00[p] * px + kval_01[p] * py + kval_02[p] * pz;
             s1 += kval_10[p] * px + kval_11[p] * py + kval_12[p] * pz;
             s2 += kval_20[p] * px + kval_21[p] * py + kval_22[p] * pz;
         }
+    }
 
-        // Warp Reduction: 32スレッド分の s0, s1, s2 をレーン0に集約する
-        for (int offset = 16; offset > 0; offset /= 2)
-        {
-            s0 += __shfl_down_sync(0xffffffff, s0, offset);
-            s1 += __shfl_down_sync(0xffffffff, s1, offset);
-            s2 += __shfl_down_sync(0xffffffff, s2, offset);
-        }
+    // Warp Reduction: 32スレッド分の s0, s1, s2 をレーン0に集約する
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
+        s0 += __shfl_down_sync(0xffffffff, s0, offset);
+        s1 += __shfl_down_sync(0xffffffff, s1, offset);
+        s2 += __shfl_down_sync(0xffffffff, s2, offset);
+    }
 
-        // 代表スレッド（レーン0）のみが最終結果をグローバルメモリに書き込む
-        if (lane_id == 0)
-        {
-            Ap0[i] = s0;
-            Ap1[i] = s1;
-            Ap2[i] = s2;
-        }
+    // 代表スレッド（レーン0）のみが最終結果をグローバルメモリに書き込む
+    if (lane_id == 0)
+    {
+        Ap0[i] = s0;
+        Ap1[i] = s1;
+        Ap2[i] = s2;
     }
 }
 
