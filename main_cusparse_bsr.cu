@@ -1,8 +1,7 @@
 /*実行コマンド
-wisteria aquariusのみで実行可能
-module load nvidia/25.9
-module load nvmpi/25.9
-nvcc main_cusparse_bsr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80
+miyabiのみで実行可能
+module load nvidia/25.11
+nvcc main_cusparse_bsr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_90
 mpirun -np 4 ./a.out
 */
 
