@@ -1,6 +1,7 @@
 /*実行コマンド
-cd /data3/kusumoto/elastodynamics-fem/
-module load nvhpc/25.1
+wisteria aquariusのみで実行可能
+module load nvidia/25.9
+module load nvmpi/25.9
 nvcc main_cusparse_bsr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80
 mpirun -np 4 ./a.out
 */
