@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-mpicxx main_omp_mpi.cpp msh_reader.cpp -fopenmp
+mpicxx main_oacc.cpp msh_reader.cpp -fopenmp -acc -Minfo=accel
 ./a.out
 */
 
@@ -12,6 +12,7 @@ mpicxx main_omp_mpi.cpp msh_reader.cpp -fopenmp
 #include <ctime>
 #include <sys/stat.h>
 #include <omp.h>
+#include <openacc.h>
 #include <mpi.h>
 
 void calculate_dN(double dN[30], double r, double s, double t);
@@ -49,42 +50,104 @@ void build_bcrs(
     int num_nodes,
     int *bcrs_row_ptr,
     int *bcrs_col_ind,
-    double *bcrs_kval,
+    double *bcrs_kval_00,
+    double *bcrs_kval_01,
+    double *bcrs_kval_02,
+    double *bcrs_kval_10,
+    double *bcrs_kval_11,
+    double *bcrs_kval_12,
+    double *bcrs_kval_20,
+    double *bcrs_kval_21,
+    double *bcrs_kval_22,
     double *bcrs_mval);
 void extract_bc_correction(
     int num_nodes,
     int *bcrs_row_ptr,
     int *bcrs_col_ind,
-    double *bcrs_kval,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
     int *bc_flag,
-    double *bc_corr);
+    double *bc_corr_00,
+    double *bc_corr_01,
+    double *bc_corr_02,
+    double *bc_corr_10,
+    double *bc_corr_11,
+    double *bc_corr_12,
+    double *bc_corr_20,
+    double *bc_corr_21,
+    double *bc_corr_22);
 void apply_bc_to_lhs(
     int num_nodes,
     int *bcrs_row_ptr,
     int *bcrs_col_ind,
-    double *bcrs_kval,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
     int *bc_flag);
 void apply_bc_to_rhs(
     int num_nodes,
     int *bc_flag,
     double *bc_val,
-    double *bc_corr,
-    double *rhs);
+    double *bc_corr_00,
+    double *bc_corr_01,
+    double *bc_corr_02,
+    double *bc_corr_10,
+    double *bc_corr_11,
+    double *bc_corr_12,
+    double *bc_corr_20,
+    double *bc_corr_21,
+    double *bc_corr_22,
+    double *rhs_0,
+    double *rhs_1,
+    double *rhs_2);
 void build_block_jacobi(
     int num_nodes,
-    int *bcrs_row_ptr,
-    int *bcrs_col_ind,
-    double *bcrs_kval,
-    double *inv_diag);
+    int *row_ptr,
+    int *col_ind,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
+    double *inv_diag_00,
+    double *inv_diag_01,
+    double *inv_diag_02,
+    double *inv_diag_10,
+    double *inv_diag_11,
+    double *inv_diag_12,
+    double *inv_diag_20,
+    double *inv_diag_21,
+    double *inv_diag_22);
 void bcrs_spmv_m(
     int num_nodes,
-    int *bcrs_row_ptr,
-    int *bcrs_col_ind,
-    double *bcrs_mval,
-    double *x,
-    double *y);
+    int *row_ptr,
+    int *col_ind,
+    double *val,
+    double *x_0,
+    double *x_1,
+    double *x_2,
+    double *y_0,
+    double *y_1,
+    double *y_2);
 int pcg_solve(
-    MPI_Request *requests,
+    MPI_Request *request,
     int num_neighbors,
     int *neighbor_ranks,
     int *recv_starts,
@@ -92,22 +155,52 @@ int pcg_solve(
     int *send_starts,
     int *send_counts,
     int *send_nodes,
-    double *send_buffer,
+    double *send_buffer_0,
+    double *send_buffer_1,
+    double *send_buffer_2,
     int num_inner,
     int num_owned,
     int num_nodes,
-    int *bcrs_row_ptr,
-    int *bcrs_col_ind,
-    double *bcrs_kval,
-    double *inv_diag,
-    double *rhs,
-    double *x,
+    int *row_ptr,
+    int *col_ind,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
+    double *inv_diag_00,
+    double *inv_diag_01,
+    double *inv_diag_02,
+    double *inv_diag_10,
+    double *inv_diag_11,
+    double *inv_diag_12,
+    double *inv_diag_20,
+    double *inv_diag_21,
+    double *inv_diag_22,
+    double *b_0,
+    double *b_1,
+    double *b_2,
+    double *x_0,
+    double *x_1,
+    double *x_2,
     double tol,
     int max_iter,
-    double *r,
-    double *z,
-    double *p,
-    double *Ap);
+    double *r_0,
+    double *r_1,
+    double *r_2,
+    double *z_0,
+    double *z_1,
+    double *z_2,
+    double *p_0,
+    double *p_1,
+    double *p_2,
+    double *Ap_0,
+    double *Ap_1,
+    double *Ap_2);
 void write_vtk_displacement(
     const char *filename,
     double *node_coords,
@@ -129,7 +222,7 @@ int main(int argc, char *argv[])
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    MPI_Request requests[100];
+    MPI_Request requests[1000];
 
     double start_time = MPI_Wtime();
 
@@ -157,6 +250,10 @@ int main(int argc, char *argv[])
     double dt = duration / num_steps;
 
     printf("使用可能な最大スレッド数：%d\n", omp_get_max_threads());
+    printf("使用可能な最大GPU数：%d\n", acc_get_num_devices(acc_device_nvidia));
+
+    acc_set_device_num(rank % acc_get_num_devices(acc_device_nvidia), acc_device_nvidia); // GPUをランクに応じて割り当て
+    acc_init(acc_device_nvidia);
 
     double *node_coords = mesh.coords_ptr();
     int num_nodes = mesh.num_total;
@@ -189,7 +286,9 @@ int main(int argc, char *argv[])
     }
     send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
     int *send_nodes_ptr = send_nodes.data();
-    double send_buffer[send_starts[num_neighbors] * 3]; // 送信節点数 * 3 (x,y,z)
+    double send_buffer_0[send_starts[num_neighbors]];
+    double send_buffer_1[send_starts[num_neighbors]];
+    double send_buffer_2[send_starts[num_neighbors]];
 
     double dN0[30] = {0.0};                                      // ガウス点での形状関数の微分の配列
     double dN1[30] = {0.0};                                      // ガウス点での形状関数の微分の配列
@@ -230,12 +329,21 @@ int main(int argc, char *argv[])
 
     int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes, coo_row, coo_col, kmat_coo_val, mmat_coo_val);
 
-    double *bcrs_kval = new double[nnz_bcrs * 9];
+    double *bcrs_kval_00 = new double[nnz_bcrs];
+    double *bcrs_kval_01 = new double[nnz_bcrs];
+    double *bcrs_kval_02 = new double[nnz_bcrs];
+    double *bcrs_kval_10 = new double[nnz_bcrs];
+    double *bcrs_kval_11 = new double[nnz_bcrs];
+    double *bcrs_kval_12 = new double[nnz_bcrs];
+    double *bcrs_kval_20 = new double[nnz_bcrs];
+    double *bcrs_kval_21 = new double[nnz_bcrs];
+    double *bcrs_kval_22 = new double[nnz_bcrs];
     double *bcrs_mval = new double[nnz_bcrs];
     int *bcrs_row_ptr = new int[num_nodes + 1];
     int *bcrs_col_ind = new int[nnz_bcrs];
 
-    build_bcrs(coo_row, coo_col, kmat_coo_val, mmat_coo_val, nnz_bcrs, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bcrs_mval);
+    build_bcrs(coo_row, coo_col, kmat_coo_val, mmat_coo_val, nnz_bcrs, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval_00, bcrs_kval_01, bcrs_kval_02,
+               bcrs_kval_10, bcrs_kval_11, bcrs_kval_12, bcrs_kval_20, bcrs_kval_21, bcrs_kval_22, bcrs_mval);
 
     delete[] coo_row;
     delete[] coo_col;
@@ -245,23 +353,59 @@ int main(int argc, char *argv[])
     std::cout << "Number of non-zero blocks in bcrs: " << nnz_bcrs << std::endl;
 
     int *bc_flag = new int[num_nodes]();
-    double *bc_corr = new double[num_nodes * 3 * 3];
-    double *inv_diag = new double[num_nodes * 9];
-    double *u = new double[(num_steps / sample_freq + 1) * 3](); // 変位の記録
-    double *u_tmp = new double[num_nodes * 3]();                 // タイムステップごとの変位の一時保存用
-    double *v_tmp = new double[num_nodes * 3]();                 // タイムステップごとの速度の一時保存用
-    double *a_tmp = new double[num_nodes * 3]();                 // タイムステップごとの加速度の一時保存用
-    double *u_prv = new double[num_nodes * 3]();                 // タイムステップごとの過去の変位の一時保存用
-    double *rhs = new double[num_nodes * 3]();
-    double *tmp = new double[num_nodes * 3]();
+    double *bc_corr_00 = new double[num_nodes]();
+    double *bc_corr_01 = new double[num_nodes]();
+    double *bc_corr_02 = new double[num_nodes]();
+    double *bc_corr_10 = new double[num_nodes]();
+    double *bc_corr_11 = new double[num_nodes]();
+    double *bc_corr_12 = new double[num_nodes]();
+    double *bc_corr_20 = new double[num_nodes]();
+    double *bc_corr_21 = new double[num_nodes]();
+    double *bc_corr_22 = new double[num_nodes]();
+    double *inv_diag_00 = new double[num_nodes]();
+    double *inv_diag_01 = new double[num_nodes]();
+    double *inv_diag_02 = new double[num_nodes]();
+    double *inv_diag_10 = new double[num_nodes]();
+    double *inv_diag_11 = new double[num_nodes]();
+    double *inv_diag_12 = new double[num_nodes]();
+    double *inv_diag_20 = new double[num_nodes]();
+    double *inv_diag_21 = new double[num_nodes]();
+    double *inv_diag_22 = new double[num_nodes]();
+    double *u = new double[(num_steps / sample_freq + 1) * 3](); // 変位の記録 (target_nodeのみ)
+    double *u_tmp_0 = new double[num_nodes]();                   // タイムステップごとの変位の一時保存用
+    double *u_tmp_1 = new double[num_nodes]();                   // タイムステップごとの変位の一時保存用
+    double *u_tmp_2 = new double[num_nodes]();                   // タイムステップごとの変位の一時保存用
+    double *v_tmp_0 = new double[num_nodes]();                   // タイムステップごとの速度の一時保存用
+    double *v_tmp_1 = new double[num_nodes]();                   // タイムステップごとの速度の一時保存用
+    double *v_tmp_2 = new double[num_nodes]();                   // タイムステップごとの速度の一時保存用
+    double *a_tmp_0 = new double[num_nodes]();                   // タイムステップごとの加速度の一時保存用
+    double *a_tmp_1 = new double[num_nodes]();                   // タイムステップごとの加速度の一時保存用
+    double *a_tmp_2 = new double[num_nodes]();                   // タイムステップごとの加速度の一時保存用
+    double *u_prv_0 = new double[num_nodes]();                   // タイムステップごとの過去の変位の一時保存用
+    double *u_prv_1 = new double[num_nodes]();                   // タイムステップごとの過去の変位の一時保存用
+    double *u_prv_2 = new double[num_nodes]();                   // タイムステップごとの過去の変位の一時保存用
+    double *rhs_0 = new double[num_nodes]();
+    double *rhs_1 = new double[num_nodes]();
+    double *rhs_2 = new double[num_nodes]();
+    double *tmp_0 = new double[num_nodes]();
+    double *tmp_1 = new double[num_nodes]();
+    double *tmp_2 = new double[num_nodes]();
 
     // PCGソルバー用のベクトル
-    double *r = new double[num_nodes * 3]();
-    double *z = new double[num_nodes * 3]();
-    double *p = new double[num_nodes * 3]();
-    double *Ap = new double[num_nodes * 3]();
+    double *r_0 = new double[num_nodes]();
+    double *r_1 = new double[num_nodes]();
+    double *r_2 = new double[num_nodes]();
+    double *z_0 = new double[num_nodes]();
+    double *z_1 = new double[num_nodes]();
+    double *z_2 = new double[num_nodes]();
+    double *p_0 = new double[num_nodes]();
+    double *p_1 = new double[num_nodes]();
+    double *p_2 = new double[num_nodes]();
+    double *Ap_0 = new double[num_nodes]();
+    double *Ap_1 = new double[num_nodes]();
+    double *Ap_2 = new double[num_nodes]();
 
-    // 境界条件
+// 境界条件
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
@@ -280,15 +424,39 @@ int main(int argc, char *argv[])
         }
     }
 
-    extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag, bc_corr);
+    extract_bc_correction(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval_00, bcrs_kval_01, bcrs_kval_02, bcrs_kval_10, bcrs_kval_11, bcrs_kval_12, bcrs_kval_20,
+                          bcrs_kval_21, bcrs_kval_22, bc_flag, bc_corr_00, bc_corr_01, bc_corr_02, bc_corr_10, bc_corr_11, bc_corr_12, bc_corr_20, bc_corr_21, bc_corr_22);
 
-    apply_bc_to_lhs(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, bc_flag);
+    apply_bc_to_lhs(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval_00, bcrs_kval_01, bcrs_kval_02, bcrs_kval_10, bcrs_kval_11, bcrs_kval_12, bcrs_kval_20, bcrs_kval_21,
+                    bcrs_kval_22, bc_flag);
 
-    build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag);
+    build_block_jacobi(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval_00, bcrs_kval_01, bcrs_kval_02, bcrs_kval_10, bcrs_kval_11, bcrs_kval_12, bcrs_kval_20, bcrs_kval_21,
+                       bcrs_kval_22, inv_diag_00, inv_diag_01, inv_diag_02, inv_diag_10, inv_diag_11, inv_diag_12, inv_diag_20, inv_diag_21, inv_diag_22);
+
+    double data_transfer_start = MPI_Wtime();
+#pragma acc enter data copyin(recv_starts[0 : num_neighbors], recv_counts[0 : num_neighbors], send_starts[0 : num_neighbors + 1], send_counts[0 : num_neighbors],             \
+                              send_nodes_ptr[0 : send_starts[num_neighbors]], send_buffer_0[0 : send_starts[num_neighbors]], send_buffer_1[0 : send_starts[num_neighbors]],   \
+                              send_buffer_2[0 : send_starts[num_neighbors]],                                                                                                  \
+                              tmp_0[0 : num_nodes], tmp_1[0 : num_nodes], tmp_2[0 : num_nodes], u_tmp_0[0 : num_nodes], u_tmp_1[0 : num_nodes], u_tmp_2[0 : num_nodes],       \
+                              v_tmp_0[0 : num_nodes], v_tmp_1[0 : num_nodes], v_tmp_2[0 : num_nodes], a_tmp_0[0 : num_nodes], a_tmp_1[0 : num_nodes], a_tmp_2[0 : num_nodes], \
+                              bcrs_row_ptr[0 : num_nodes + 1], bcrs_col_ind[0 : nnz_bcrs], bcrs_mval[0 : nnz_bcrs], rhs_0[0 : num_nodes], rhs_1[0 : num_nodes],               \
+                              rhs_2[0 : num_nodes], bc_flag[0 : num_nodes],                                                                                                   \
+                              bcrs_kval_00[0 : nnz_bcrs], bcrs_kval_01[0 : nnz_bcrs], bcrs_kval_02[0 : nnz_bcrs], bcrs_kval_10[0 : nnz_bcrs],                                 \
+                              bcrs_kval_11[0 : nnz_bcrs], bcrs_kval_12[0 : nnz_bcrs], bcrs_kval_20[0 : nnz_bcrs], bcrs_kval_21[0 : nnz_bcrs], bcrs_kval_22[0 : nnz_bcrs],     \
+                              bc_corr_00[0 : num_nodes], bc_corr_01[0 : num_nodes], bc_corr_02[0 : num_nodes], bc_corr_10[0 : num_nodes], bc_corr_11[0 : num_nodes],          \
+                              bc_corr_12[0 : num_nodes], bc_corr_20[0 : num_nodes], bc_corr_21[0 : num_nodes], bc_corr_22[0 : num_nodes],                                     \
+                              inv_diag_00[0 : num_nodes], inv_diag_01[0 : num_nodes], inv_diag_02[0 : num_nodes], inv_diag_10[0 : num_nodes], inv_diag_11[0 : num_nodes],     \
+                              inv_diag_12[0 : num_nodes], inv_diag_20[0 : num_nodes], inv_diag_21[0 : num_nodes], inv_diag_22[0 : num_nodes],                                 \
+                              r_0[0 : num_nodes], r_1[0 : num_nodes], r_2[0 : num_nodes], z_0[0 : num_nodes], z_1[0 : num_nodes], z_2[0 : num_nodes],                         \
+                              p_0[0 : num_nodes], p_1[0 : num_nodes], p_2[0 : num_nodes], Ap_0[0 : num_nodes], Ap_1[0 : num_nodes], Ap_2[0 : num_nodes],                      \
+                              u_prv_0[0 : num_nodes], u_prv_1[0 : num_nodes], u_prv_2[0 : num_nodes])
+    double data_transfer_end = MPI_Wtime();
+    printf("Data transfer to GPU time: %.2f seconds\n", data_transfer_end - data_transfer_start);
 
     double bc_val_u[3] = {0.0};
     double bc_val_v[3] = {0.0};
     double bc_val_a[3] = {0.0};
+#pragma acc enter data copyin(bc_val_u[0 : 3], bc_val_v[0 : 3], bc_val_a[0 : 3])
 
     // タイムステップループ
     for (int step = 1; step <= num_steps; step++)
@@ -303,45 +471,67 @@ int main(int argc, char *argv[])
         bc_val_a[0] = 0.0;
         bc_val_a[1] = -sin(t);
         bc_val_a[2] = 0.0;
+#pragma acc update device(bc_val_u[0 : 3], bc_val_v[0 : 3], bc_val_a[0 : 3]) // 境界条件の値をGPUに転送
 
         // ここでrhsを構築（外力の寄与なども加える） u, v, aは全節点について、前のタイムステップから正しい値を引き継いでいる
-#pragma omp parallel for
-        for (int i = 0; i < num_nodes * 3; i++)
+#pragma acc parallel loop present(tmp_0, tmp_1, tmp_2, u_tmp_0, u_tmp_1, u_tmp_2, v_tmp_0, v_tmp_1, v_tmp_2, a_tmp_0, a_tmp_1, a_tmp_2)
+        for (int i = 0; i < num_nodes; i++)
         {
             // Newmark-β法の右辺の構築
-            tmp[i] = u_tmp[i] * 4.0 / dt / dt + v_tmp[i] * 4.0 / dt + a_tmp[i];
+            tmp_0[i] = u_tmp_0[i] * 4.0 / dt / dt + v_tmp_0[i] * 4.0 / dt + a_tmp_0[i];
+            tmp_1[i] = u_tmp_1[i] * 4.0 / dt / dt + v_tmp_1[i] * 4.0 / dt + a_tmp_1[i];
+            tmp_2[i] = u_tmp_2[i] * 4.0 / dt / dt + v_tmp_2[i] * 4.0 / dt + a_tmp_2[i];
         }
-        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp, rhs); // 質量行列の寄与 rhsは所有節点について正しい値を持つ
+        bcrs_spmv_m(num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_mval, tmp_0, tmp_1, tmp_2, rhs_0, rhs_1, rhs_2); // 質量行列の寄与 rhsは所有節点について正しい値を持つ
         if (force_node >= 0)
         {
-            rhs[force_node * 3 + force_dof] += force_magnitude; // 外力の寄与
+            if (force_dof == 0)
+            {
+#pragma acc update self(rhs_0[force_node : 1])
+                rhs_0[force_node] += force_magnitude;
+#pragma acc update device(rhs_0[force_node : 1])
+            }
+            else if (force_dof == 1)
+            {
+#pragma acc update self(rhs_1[force_node : 1])
+                rhs_1[force_node] += force_magnitude;
+#pragma acc update device(rhs_1[force_node : 1])
+            }
+            else if (force_dof == 2)
+            {
+#pragma acc update self(rhs_2[force_node : 1])
+                rhs_2[force_node] += force_magnitude;
+#pragma acc update device(rhs_2[force_node : 1])
+            }
         }
 
-        apply_bc_to_rhs(num_nodes, bc_flag, bc_val_u, bc_corr, rhs);
+        apply_bc_to_rhs(num_nodes, bc_flag, bc_val_u, bc_corr_00, bc_corr_01, bc_corr_02, bc_corr_10, bc_corr_11, bc_corr_12, bc_corr_20, bc_corr_21, bc_corr_22, rhs_0, rhs_1, rhs_2);
 
-        int iter = pcg_solve(requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer,
-                             num_inner, num_owned, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3, r, z, p, Ap);
+        int iter = pcg_solve(requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer_0, send_buffer_1, send_buffer_2,
+                             num_inner, num_owned, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval_00, bcrs_kval_01, bcrs_kval_02, bcrs_kval_10, bcrs_kval_11, bcrs_kval_12, bcrs_kval_20,
+                             bcrs_kval_21, bcrs_kval_22, inv_diag_00, inv_diag_01, inv_diag_02, inv_diag_10, inv_diag_11, inv_diag_12, inv_diag_20, inv_diag_21, inv_diag_22,
+                             rhs_0, rhs_1, rhs_2, u_tmp_0, u_tmp_1, u_tmp_2, 1e-8, num_nodes * 3, r_0, r_1, r_2, z_0, z_1, z_2, p_0, p_1, p_2, Ap_0, Ap_1, Ap_2);
         if (rank == 0)
         {
             std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
         }
 
         // 速度と加速度の更新（Newmark-β法） u,v,aは全節点について正しい値をもつ
-#pragma omp parallel for
+#pragma acc parallel loop present(u_tmp_0, u_tmp_1, u_tmp_2, u_prv_0, u_prv_1, u_prv_2, v_tmp_0, v_tmp_1, v_tmp_2, a_tmp_0, a_tmp_1, a_tmp_2, bc_flag, bc_val_u, bc_val_v, bc_val_a)
         for (int i = 0; i < num_nodes; i++)
         {
-            double u_new_0 = u_tmp[i * 3 + 0];
-            double u_new_1 = u_tmp[i * 3 + 1];
-            double u_new_2 = u_tmp[i * 3 + 2];
-            double u_old_0 = u_prv[i * 3 + 0];
-            double u_old_1 = u_prv[i * 3 + 1];
-            double u_old_2 = u_prv[i * 3 + 2];
-            double v_old_0 = v_tmp[i * 3 + 0];
-            double v_old_1 = v_tmp[i * 3 + 1];
-            double v_old_2 = v_tmp[i * 3 + 2];
-            double a_old_0 = a_tmp[i * 3 + 0];
-            double a_old_1 = a_tmp[i * 3 + 1];
-            double a_old_2 = a_tmp[i * 3 + 2];
+            double u_new_0 = u_tmp_0[i];
+            double u_new_1 = u_tmp_1[i];
+            double u_new_2 = u_tmp_2[i];
+            double u_old_0 = u_prv_0[i];
+            double u_old_1 = u_prv_1[i];
+            double u_old_2 = u_prv_2[i];
+            double v_old_0 = v_tmp_0[i];
+            double v_old_1 = v_tmp_1[i];
+            double v_old_2 = v_tmp_2[i];
+            double a_old_0 = a_tmp_0[i];
+            double a_old_1 = a_tmp_1[i];
+            double a_old_2 = a_tmp_2[i];
 
             double a_new_0 = (u_new_0 - u_old_0) * 4.0 / dt / dt - v_old_0 * 4.0 / dt - a_old_0;
             double a_new_1 = (u_new_1 - u_old_1) * 4.0 / dt / dt - v_old_1 * 4.0 / dt - a_old_1;
@@ -363,15 +553,15 @@ int main(int argc, char *argv[])
                 a_new_2 = bc_val_a[2];
             }
 
-            u_prv[i * 3 + 0] = u_new_0;
-            u_prv[i * 3 + 1] = u_new_1;
-            u_prv[i * 3 + 2] = u_new_2;
-            v_tmp[i * 3 + 0] = v_new_0;
-            v_tmp[i * 3 + 1] = v_new_1;
-            v_tmp[i * 3 + 2] = v_new_2;
-            a_tmp[i * 3 + 0] = a_new_0;
-            a_tmp[i * 3 + 1] = a_new_1;
-            a_tmp[i * 3 + 2] = a_new_2;
+            u_prv_0[i] = u_new_0;
+            u_prv_1[i] = u_new_1;
+            u_prv_2[i] = u_new_2;
+            v_tmp_0[i] = v_new_0;
+            v_tmp_1[i] = v_new_1;
+            v_tmp_2[i] = v_new_2;
+            a_tmp_0[i] = a_new_0;
+            a_tmp_1[i] = a_new_1;
+            a_tmp_2[i] = a_new_2;
         }
 
         // 解xを変位uに保存
@@ -379,12 +569,17 @@ int main(int argc, char *argv[])
         {
             if (target_node >= 0) // 自プロセスに対象ノードがある場合のみ保存
             {
-                u[(step / sample_freq) * 3 + 0] = u_tmp[target_node * 3 + 0];
-                u[(step / sample_freq) * 3 + 1] = u_tmp[target_node * 3 + 1];
-                u[(step / sample_freq) * 3 + 2] = u_tmp[target_node * 3 + 2];
+#pragma acc update self(u_tmp_0[target_node : 1], u_tmp_1[target_node : 1], u_tmp_2[target_node : 1]) // 対象ノードの変位をCPUに転送
+                u[(step / sample_freq) * 3 + 0] = u_tmp_0[target_node];
+                u[(step / sample_freq) * 3 + 1] = u_tmp_1[target_node];
+                u[(step / sample_freq) * 3 + 2] = u_tmp_2[target_node];
             }
         }
     }
+
+    data_transfer_start = MPI_Wtime();
+    data_transfer_end = MPI_Wtime();
+    printf("Data transfer from GPU time: %.2f seconds\n", data_transfer_end - data_transfer_start);
 
     if (target_node >= 0)
     {
@@ -756,17 +951,32 @@ void build_bcrs(
     int num_nodes,
     int *bcrs_row_ptr,
     int *bcrs_col_ind,
-    double *bcrs_kval,
+    double *bcrs_kval_00,
+    double *bcrs_kval_01,
+    double *bcrs_kval_02,
+    double *bcrs_kval_10,
+    double *bcrs_kval_11,
+    double *bcrs_kval_12,
+    double *bcrs_kval_20,
+    double *bcrs_kval_21,
+    double *bcrs_kval_22,
     double *bcrs_mval)
 {
-    // 並び替え済みCOOからbcrsを構築
+    // 並び替え済みCOOからbcrsを構築 00成分が0~nnz_bcrs-1、01成分がnnz_bcrs~2*nnz_bcrs-1、02成分が2*nnz_bcrs~3*nnz_bcrs-1、...という配置で、bcrs_kvalに9成分ずつ格納されているとする。
     // col_ind, kval, mval をコピー
 #pragma omp parallel for
     for (int k = 0; k < nnz_bcrs; k++)
     {
         bcrs_col_ind[k] = coo_col[k];
-        for (int a = 0; a < 9; a++)
-            bcrs_kval[9 * k + a] = kmat_coo_val[9 * k + a];
+        bcrs_kval_00[k] = kmat_coo_val[9 * k + 0];
+        bcrs_kval_01[k] = kmat_coo_val[9 * k + 1];
+        bcrs_kval_02[k] = kmat_coo_val[9 * k + 2];
+        bcrs_kval_10[k] = kmat_coo_val[9 * k + 3];
+        bcrs_kval_11[k] = kmat_coo_val[9 * k + 4];
+        bcrs_kval_12[k] = kmat_coo_val[9 * k + 5];
+        bcrs_kval_20[k] = kmat_coo_val[9 * k + 6];
+        bcrs_kval_21[k] = kmat_coo_val[9 * k + 7];
+        bcrs_kval_22[k] = kmat_coo_val[9 * k + 8];
         bcrs_mval[k] = mmat_coo_val[k];
     }
 
@@ -791,24 +1001,29 @@ void bcrs_spmv_m(
     int *row_ptr,
     int *col_ind,
     double *val,
-    double *x,
-    double *y)
+    double *x_0,
+    double *x_1,
+    double *x_2,
+    double *y_0,
+    double *y_1,
+    double *y_2)
 {
     // bcrs 行列ベクトル積: y = A * x
-#pragma omp parallel for
+#pragma acc parallel loop present(row_ptr, col_ind, val, x_0, x_1, x_2, y_0, y_1, y_2)
     for (int i = 0; i < num_nodes; i++)
     {
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
         for (int p = row_ptr[i]; p < row_ptr[i + 1]; p++)
         {
             int j = col_ind[p];
-            y0 += val[p] * x[j * 3 + 0];
-            y1 += val[p] * x[j * 3 + 1];
-            y2 += val[p] * x[j * 3 + 2];
+            y0 += val[p] * x_0[j];
+            y1 += val[p] * x_1[j];
+            y2 += val[p] * x_2[j];
         }
-        y[i * 3 + 0] = y0;
-        y[i * 3 + 1] = y1;
-        y[i * 3 + 2] = y2;
+        y_0[i] = y0;
+        y_1[i] = y1;
+        y_2[i] = y2;
     }
 }
 
@@ -816,18 +1031,33 @@ void extract_bc_correction(
     int num_nodes,
     int *row_ptr,
     int *col_ind,
-    double *kval,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
     int *bc_flag,
-    double *bc_corr)
+    double *bc_corr_00,
+    double *bc_corr_01,
+    double *bc_corr_02,
+    double *bc_corr_10,
+    double *bc_corr_11,
+    double *bc_corr_12,
+    double *bc_corr_20,
+    double *bc_corr_21,
+    double *bc_corr_22)
 {
     // 境界条件の補正ベクトルを抽出
     // 自由節点iと拘束節点jの間のカップリング A[i][j] を抽出する。
     // 毎タイムステップの右辺ベクトル補正に使う。
     // bc_corr[num_nodes * 3][3]: bc_corr[i*3+a][b] = Σ_{j∈constrained} A_original[i][j][a][b]
-    int ndof = num_nodes * 3;
 #pragma omp parallel for
-    for (int i = 0; i < ndof * 3; i++)
-        bc_corr[i] = 0.0;
+    for (int i = 0; i < num_nodes; i++)
+        bc_corr_00[i] = bc_corr_01[i] = bc_corr_02[i] = bc_corr_10[i] = bc_corr_11[i] = bc_corr_12[i] = bc_corr_20[i] = bc_corr_21[i] = bc_corr_22[i] = 0.0;
 
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
@@ -841,8 +1071,15 @@ void extract_bc_correction(
             if (!bc_flag[j])
                 continue;
 
-            for (int a = 0; a < 9; a++)
-                bc_corr[9 * i + a] += kval[9 * p + a];
+            bc_corr_00[i] += kval_00[p];
+            bc_corr_01[i] += kval_01[p];
+            bc_corr_02[i] += kval_02[p];
+            bc_corr_10[i] += kval_10[p];
+            bc_corr_11[i] += kval_11[p];
+            bc_corr_12[i] += kval_12[p];
+            bc_corr_20[i] += kval_20[p];
+            bc_corr_21[i] += kval_21[p];
+            bc_corr_22[i] += kval_22[p];
         }
     }
 }
@@ -851,7 +1088,15 @@ void apply_bc_to_lhs(
     int num_nodes,
     int *row_ptr,
     int *col_ind,
-    double *kval,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
     int *bc_flag)
 {
     // 境界条件を左辺行列に適用（1回だけ呼ぶ）
@@ -865,15 +1110,12 @@ void apply_bc_to_lhs(
 
             if (bc_flag[i] || bc_flag[j])
             {
-                for (int a = 0; a < 9; a++)
-                    kval[9 * p + a] = 0.0;
+                kval_00[p] = kval_01[p] = kval_02[p] = kval_10[p] = kval_11[p] = kval_12[p] = kval_20[p] = kval_21[p] = kval_22[p] = 0.0;
             }
 
             if (bc_flag[i] && i == j)
             {
-                kval[9 * p + 3 * 0 + 0] = 1.0;
-                kval[9 * p + 3 * 1 + 1] = 1.0;
-                kval[9 * p + 3 * 2 + 2] = 1.0;
+                kval_00[p] = kval_11[p] = kval_22[p] = 1.0;
             }
         }
     }
@@ -883,28 +1125,39 @@ void apply_bc_to_rhs(
     int num_nodes,
     int *bc_flag,
     double *bc_val,
-    double *bc_corr,
-    double *rhs)
+    double *bc_corr_00,
+    double *bc_corr_01,
+    double *bc_corr_02,
+    double *bc_corr_10,
+    double *bc_corr_11,
+    double *bc_corr_12,
+    double *bc_corr_20,
+    double *bc_corr_21,
+    double *bc_corr_22,
+    double *rhs_0,
+    double *rhs_1,
+    double *rhs_2)
 {
     // 境界条件を右辺ベクトルに適用（毎タイムステップ呼ぶ）
     // bc_val[3]: 拘束変位値（全拘束節点で共通、例: {0, sin(t), 0}）
     // 自由節点の右辺を補正: rhs[i] -= Σ_b bc_corr[i][b] * bc_val[b]
-    int ndof = num_nodes * 3;
-#pragma omp parallel for
-    for (int i = 0; i < ndof; i++)
+#pragma acc parallel loop present(bc_val, bc_corr_00, bc_corr_01, bc_corr_02, bc_corr_10, bc_corr_11, bc_corr_12, bc_corr_20, bc_corr_21, bc_corr_22, rhs_0, rhs_1, rhs_2)
+    for (int i = 0; i < num_nodes; i++)
     {
-        rhs[i] -= bc_corr[3 * i + 0] * bc_val[0] + bc_corr[3 * i + 1] * bc_val[1] + bc_corr[3 * i + 2] * bc_val[2];
+        rhs_0[i] -= bc_corr_00[i] * bc_val[0] + bc_corr_01[i] * bc_val[1] + bc_corr_02[i] * bc_val[2];
+        rhs_1[i] -= bc_corr_10[i] * bc_val[0] + bc_corr_11[i] * bc_val[1] + bc_corr_12[i] * bc_val[2];
+        rhs_2[i] -= bc_corr_20[i] * bc_val[0] + bc_corr_21[i] * bc_val[1] + bc_corr_22[i] * bc_val[2];
     }
 
     // 拘束節点の右辺を拘束値に設定
-#pragma omp parallel for
+#pragma acc parallel loop present(bc_flag, bc_val, rhs_0, rhs_1, rhs_2)
     for (int i = 0; i < num_nodes; i++)
     {
         if (bc_flag[i])
         {
-            rhs[i * 3 + 0] = bc_val[0];
-            rhs[i * 3 + 1] = bc_val[1];
-            rhs[i * 3 + 2] = bc_val[2];
+            rhs_0[i] = bc_val[0];
+            rhs_1[i] = bc_val[1];
+            rhs_2[i] = bc_val[2];
         }
     }
 }
@@ -913,8 +1166,24 @@ void build_block_jacobi(
     int num_nodes,
     int *row_ptr,
     int *col_ind,
-    double *kval,
-    double *inv_diag)
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
+    double *inv_diag_00,
+    double *inv_diag_01,
+    double *inv_diag_02,
+    double *inv_diag_10,
+    double *inv_diag_11,
+    double *inv_diag_12,
+    double *inv_diag_20,
+    double *inv_diag_21,
+    double *inv_diag_22)
 {
     // ブロックヤコビ前処理の構築（対角ブロックの逆行列を計算）
 #pragma omp parallel for
@@ -927,14 +1196,28 @@ void build_block_jacobi(
         {
             if (col_ind[p] == i)
             {
-                for (int a = 0; a < 9; a++)
-                    d[a] = kval[9 * p + a];
+                d[0] = kval_00[p];
+                d[1] = kval_01[p];
+                d[2] = kval_02[p];
+                d[3] = kval_10[p];
+                d[4] = kval_11[p];
+                d[5] = kval_12[p];
+                d[6] = kval_20[p];
+                d[7] = kval_21[p];
+                d[8] = kval_22[p];
                 break;
             }
         }
         inverse_3_3_mat(d, inv_d);
-        for (int a = 0; a < 9; a++)
-            inv_diag[9 * i + a] = inv_d[a];
+        inv_diag_00[i] = inv_d[0];
+        inv_diag_01[i] = inv_d[1];
+        inv_diag_02[i] = inv_d[2];
+        inv_diag_10[i] = inv_d[3];
+        inv_diag_11[i] = inv_d[4];
+        inv_diag_12[i] = inv_d[5];
+        inv_diag_20[i] = inv_d[6];
+        inv_diag_21[i] = inv_d[7];
+        inv_diag_22[i] = inv_d[8];
     }
 }
 
@@ -959,22 +1242,52 @@ int pcg_solve(
     int *send_starts,
     int *send_counts,
     int *send_nodes,
-    double *send_buffer,
+    double *send_buffer_0,
+    double *send_buffer_1,
+    double *send_buffer_2,
     int num_inner,
     int num_owned,
     int num_nodes,
     int *row_ptr,
     int *col_ind,
-    double *kval,
-    double *inv_diag,
-    double *b,
-    double *x,
+    double *kval_00,
+    double *kval_01,
+    double *kval_02,
+    double *kval_10,
+    double *kval_11,
+    double *kval_12,
+    double *kval_20,
+    double *kval_21,
+    double *kval_22,
+    double *inv_diag_00,
+    double *inv_diag_01,
+    double *inv_diag_02,
+    double *inv_diag_10,
+    double *inv_diag_11,
+    double *inv_diag_12,
+    double *inv_diag_20,
+    double *inv_diag_21,
+    double *inv_diag_22,
+    double *b_0,
+    double *b_1,
+    double *b_2,
+    double *x_0,
+    double *x_1,
+    double *x_2,
     double tol,
     int max_iter,
-    double *r,
-    double *z,
-    double *p,
-    double *Ap)
+    double *r_0,
+    double *r_1,
+    double *r_2,
+    double *z_0,
+    double *z_1,
+    double *z_2,
+    double *p_0,
+    double *p_1,
+    double *p_2,
+    double *Ap_0,
+    double *Ap_1,
+    double *Ap_2)
 {
     // Ax = b を前処理付き共役勾配法で解く。
     // x は初期解を入れて呼ぶ（ゼロでもよい）。解が上書きされる。
@@ -982,46 +1295,50 @@ int pcg_solve(
     double b_norm = 0.0;
     double r_norm = 0.0;
 
-#pragma omp parallel for reduction(+ : rz, b_norm, r_norm)
+#pragma acc parallel loop reduction(+ : rz, b_norm, r_norm) present(row_ptr, col_ind, kval_00, kval_01, kval_02, kval_10, kval_11, kval_12, kval_20, kval_21, kval_22,      \
+                                                                    inv_diag_00, inv_diag_01, inv_diag_02, inv_diag_10, inv_diag_11, inv_diag_12, inv_diag_20, inv_diag_21, \
+                                                                    inv_diag_22, b_0, b_1, b_2, x_0, x_1, x_2, r_0, r_1, r_2,                                               \
+                                                                    z_0, z_1, z_2, p_0, p_1, p_2, Ap_0, Ap_1, Ap_2)
     for (int i = 0; i < num_owned; i++)
     {
         // r = b - A*x　r,bは所有節点について、xは全節点について正しい値が入っている
         double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
         for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
         {
             int j = col_ind[p_];
-            double x0 = x[j * 3 + 0];
-            double x1 = x[j * 3 + 1];
-            double x2 = x[j * 3 + 2];
-            y0 += kval[9 * p_ + 3 * 0 + 0] * x0 + kval[9 * p_ + 3 * 0 + 1] * x1 + kval[9 * p_ + 3 * 0 + 2] * x2;
-            y1 += kval[9 * p_ + 3 * 1 + 0] * x0 + kval[9 * p_ + 3 * 1 + 1] * x1 + kval[9 * p_ + 3 * 1 + 2] * x2;
-            y2 += kval[9 * p_ + 3 * 2 + 0] * x0 + kval[9 * p_ + 3 * 2 + 1] * x1 + kval[9 * p_ + 3 * 2 + 2] * x2;
+            double x0 = x_0[j];
+            double x1 = x_1[j];
+            double x2 = x_2[j];
+            y0 += kval_00[p_] * x0 + kval_01[p_] * x1 + kval_02[p_] * x2;
+            y1 += kval_10[p_] * x0 + kval_11[p_] * x1 + kval_12[p_] * x2;
+            y2 += kval_20[p_] * x0 + kval_21[p_] * x1 + kval_22[p_] * x2;
         }
-        Ap[i * 3 + 0] = y0;
-        Ap[i * 3 + 1] = y1;
-        Ap[i * 3 + 2] = y2;
-        double b0 = b[i * 3 + 0];
-        double b1 = b[i * 3 + 1];
-        double b2 = b[i * 3 + 2];
+        Ap_0[i] = y0;
+        Ap_1[i] = y1;
+        Ap_2[i] = y2;
+        double b0 = b_0[i];
+        double b1 = b_1[i];
+        double b2 = b_2[i];
         double r0 = b0 - y0;
         double r1 = b1 - y1;
         double r2 = b2 - y2;
-        r[i * 3 + 0] = r0;
-        r[i * 3 + 1] = r1;
-        r[i * 3 + 2] = r2;
+        r_0[i] = r0;
+        r_1[i] = r1;
+        r_2[i] = r2;
 
         // z = C⁻¹r zは所有節点について正しい値が入る
-        double z0 = inv_diag[9 * i + 3 * 0 + 0] * r0 + inv_diag[9 * i + 3 * 0 + 1] * r1 + inv_diag[9 * i + 3 * 0 + 2] * r2;
-        double z1 = inv_diag[9 * i + 3 * 1 + 0] * r0 + inv_diag[9 * i + 3 * 1 + 1] * r1 + inv_diag[9 * i + 3 * 1 + 2] * r2;
-        double z2 = inv_diag[9 * i + 3 * 2 + 0] * r0 + inv_diag[9 * i + 3 * 2 + 1] * r1 + inv_diag[9 * i + 3 * 2 + 2] * r2;
-        z[i * 3 + 0] = z0;
-        z[i * 3 + 1] = z1;
-        z[i * 3 + 2] = z2;
+        double z0 = inv_diag_00[i] * r0 + inv_diag_01[i] * r1 + inv_diag_02[i] * r2;
+        double z1 = inv_diag_10[i] * r0 + inv_diag_11[i] * r1 + inv_diag_12[i] * r2;
+        double z2 = inv_diag_20[i] * r0 + inv_diag_21[i] * r1 + inv_diag_22[i] * r2;
+        z_0[i] = z0;
+        z_1[i] = z1;
+        z_2[i] = z2;
 
         // p = z pは所有節点について正しい値が入る
-        p[i * 3 + 0] = z0;
-        p[i * 3 + 1] = z1;
-        p[i * 3 + 2] = z2;
+        p_0[i] = z0;
+        p_1[i] = z1;
+        p_2[i] = z2;
 
         // rz = r · z
         rz += r0 * z0 + r1 * z1 + r2 * z2;
@@ -1049,69 +1366,81 @@ int pcg_solve(
     int iter;
     for (iter = 0; iter < max_iter; iter++)
     {
-        // pは全節点について正しい必要があるので、ゴースト節点を送受信する。
+        // pは全節点について正しい必要があるので、GPU間でゴースト節点を送受信する。
         for (int n = 0; n < num_neighbors; n++)
         {
             int send_start = send_starts[n];
             // 送信用にまずはバッファにコピー
-#pragma omp parallel for
+#pragma acc parallel loop present(p_0, p_1, p_2, send_buffer_0, send_buffer_1, send_buffer_2, send_nodes)
             for (int i = 0; i < send_counts[n]; i++)
             {
                 int node = send_nodes[send_start + i];
-                send_buffer[3 * (send_start + i) + 0] = p[node * 3 + 0];
-                send_buffer[3 * (send_start + i) + 1] = p[node * 3 + 1];
-                send_buffer[3 * (send_start + i) + 2] = p[node * 3 + 2];
+                send_buffer_0[send_start + i] = p_0[node];
+                send_buffer_1[send_start + i] = p_1[node];
+                send_buffer_2[send_start + i] = p_2[node];
             }
-            // 送信
-            MPI_Isend(&send_buffer[3 * send_start], send_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            // 受信
-            MPI_Irecv(&p[recv_starts[n] * 3], recv_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
+
+#pragma acc host_data use_device(send_buffer_0, send_buffer_1, send_buffer_2, p_0, p_1, p_2)
+            {
+                MPI_Isend(&send_buffer_0[send_start], send_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+                MPI_Isend(&send_buffer_1[send_start], send_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
+                MPI_Isend(&send_buffer_2[send_start], send_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
+                MPI_Irecv(&p_0[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
+                MPI_Irecv(&p_1[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
+                MPI_Irecv(&p_2[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
+            }
         }
 
         double pAp = 0.0;
         // 通信が不要な内側の節点については先に計算しておく
-#pragma omp parallel for reduction(+ : pAp)
+#pragma acc parallel loop present(row_ptr, col_ind, kval_00, kval_01, kval_02, kval_10, kval_11, kval_12, kval_20, kval_21, kval_22, p_0, p_1, p_2, Ap_0, Ap_1, Ap_2) gang
         for (int i = 0; i < num_inner; i++)
         {
             // Ap = A * p Apは所有節点について正しい値が入る
             double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop vector reduction(+ : y0, y1, y2)
             for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
             {
                 int j = col_ind[p_];
-                y0 += kval[9 * p_ + 3 * 0 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 0 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 0 + 2] * p[j * 3 + 2];
-                y1 += kval[9 * p_ + 3 * 1 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 1 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 1 + 2] * p[j * 3 + 2];
-                y2 += kval[9 * p_ + 3 * 2 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 2 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 2 + 2] * p[j * 3 + 2];
+                y0 += kval_00[p_] * p_0[j] + kval_01[p_] * p_1[j] + kval_02[p_] * p_2[j];
+                y1 += kval_10[p_] * p_0[j] + kval_11[p_] * p_1[j] + kval_12[p_] * p_2[j];
+                y2 += kval_20[p_] * p_0[j] + kval_21[p_] * p_1[j] + kval_22[p_] * p_2[j];
             }
-            Ap[i * 3 + 0] = y0;
-            Ap[i * 3 + 1] = y1;
-            Ap[i * 3 + 2] = y2;
+            Ap_0[i] = y0;
+            Ap_1[i] = y1;
+            Ap_2[i] = y2;
+        }
 
+#pragma acc parallel loop reduction(+ : pAp) present(p_0, p_1, p_2, Ap_0, Ap_1, Ap_2)
+        for (int i = 0; i < num_inner; i++)
+        {
             // pAp = p · Ap
-            pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
+            pAp += p_0[i] * Ap_0[i] + p_1[i] * Ap_1[i] + p_2[i] * Ap_2[i];
         }
 
         // ゴースト節点を待つ。pは全節点について正しい値が入る
-        MPI_Waitall(2 * num_neighbors, request, MPI_STATUSES_IGNORE);
+        MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
 
         // 通信が必要な外側の節点について計算
-#pragma omp parallel for reduction(+ : pAp)
+#pragma acc parallel loop reduction(+ : pAp) present(row_ptr, col_ind, kval_00, kval_01, kval_02, kval_10, kval_11, kval_12, kval_20, kval_21, kval_22, p_0, p_1, p_2, Ap_0, Ap_1, Ap_2)
         for (int i = num_inner; i < num_owned; i++)
         {
             // Ap = A * p
             double y0 = 0.0, y1 = 0.0, y2 = 0.0;
+#pragma acc loop seq
             for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
             {
                 int j = col_ind[p_];
-                y0 += kval[9 * p_ + 3 * 0 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 0 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 0 + 2] * p[j * 3 + 2];
-                y1 += kval[9 * p_ + 3 * 1 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 1 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 1 + 2] * p[j * 3 + 2];
-                y2 += kval[9 * p_ + 3 * 2 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 2 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 2 + 2] * p[j * 3 + 2];
+                y0 += kval_00[p_] * p_0[j] + kval_01[p_] * p_1[j] + kval_02[p_] * p_2[j];
+                y1 += kval_10[p_] * p_0[j] + kval_11[p_] * p_1[j] + kval_12[p_] * p_2[j];
+                y2 += kval_20[p_] * p_0[j] + kval_21[p_] * p_1[j] + kval_22[p_] * p_2[j];
             }
-            Ap[i * 3 + 0] = y0;
-            Ap[i * 3 + 1] = y1;
-            Ap[i * 3 + 2] = y2;
+            Ap_0[i] = y0;
+            Ap_1[i] = y1;
+            Ap_2[i] = y2;
 
             // pAp = p · Ap
-            pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
+            pAp += p_0[i] * y0 + p_1[i] * y1 + p_2[i] * y2;
         }
 
         MPI_Allreduce(MPI_IN_PLACE, &pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -1119,27 +1448,27 @@ int pcg_solve(
         // alpha = rz / (p · Ap)
         double alpha = rz / pAp;
 
-#pragma omp parallel for
+#pragma acc parallel loop present(x_0, x_1, x_2, p_0, p_1, p_2)
         for (int i = 0; i < num_nodes; i++)
         {
             // xの更新
             // x += alpha * p xは全節点について正しい値が入る
-            x[i * 3 + 0] += alpha * p[i * 3 + 0];
-            x[i * 3 + 1] += alpha * p[i * 3 + 1];
-            x[i * 3 + 2] += alpha * p[i * 3 + 2];
+            x_0[i] += alpha * p_0[i];
+            x_1[i] += alpha * p_1[i];
+            x_2[i] += alpha * p_2[i];
         }
 
         r_norm = 0.0;
-#pragma omp parallel for reduction(+ : r_norm)
+#pragma acc parallel loop reduction(+ : r_norm) present(r_0, r_1, r_2, Ap_0, Ap_1, Ap_2)
         for (int i = 0; i < num_owned; i++)
         {
             // r -= alpha * Ap rは所有節点について正しい値が入る
-            double r_i_0 = r[i * 3 + 0] - alpha * Ap[i * 3 + 0];
-            double r_i_1 = r[i * 3 + 1] - alpha * Ap[i * 3 + 1];
-            double r_i_2 = r[i * 3 + 2] - alpha * Ap[i * 3 + 2];
-            r[i * 3 + 0] = r_i_0;
-            r[i * 3 + 1] = r_i_1;
-            r[i * 3 + 2] = r_i_2;
+            double r_i_0 = r_0[i] - alpha * Ap_0[i];
+            double r_i_1 = r_1[i] - alpha * Ap_1[i];
+            double r_i_2 = r_2[i] - alpha * Ap_2[i];
+            r_0[i] = r_i_0;
+            r_1[i] = r_i_1;
+            r_2[i] = r_i_2;
 
             // rのノルム
             r_norm += r_i_0 * r_i_0 + r_i_1 * r_i_1 + r_i_2 * r_i_2;
@@ -1155,19 +1484,20 @@ int pcg_solve(
         }
 
         double rz_new = 0.0;
-#pragma omp parallel for reduction(+ : rz_new)
+#pragma acc parallel loop reduction(+ : rz_new) present(r_0, r_1, r_2, z_0, z_1, z_2, \
+                                                        inv_diag_00, inv_diag_01, inv_diag_02, inv_diag_10, inv_diag_11, inv_diag_12, inv_diag_20, inv_diag_21, inv_diag_22)
         for (int i = 0; i < num_owned; i++)
         {
             // z = C⁻¹r zは所有節点について正しい値が入る
-            double r0 = r[i * 3 + 0];
-            double r1 = r[i * 3 + 1];
-            double r2 = r[i * 3 + 2];
-            double z0 = inv_diag[9 * i + 3 * 0 + 0] * r0 + inv_diag[9 * i + 3 * 0 + 1] * r1 + inv_diag[9 * i + 3 * 0 + 2] * r2;
-            double z1 = inv_diag[9 * i + 3 * 1 + 0] * r0 + inv_diag[9 * i + 3 * 1 + 1] * r1 + inv_diag[9 * i + 3 * 1 + 2] * r2;
-            double z2 = inv_diag[9 * i + 3 * 2 + 0] * r0 + inv_diag[9 * i + 3 * 2 + 1] * r1 + inv_diag[9 * i + 3 * 2 + 2] * r2;
-            z[i * 3 + 0] = z0;
-            z[i * 3 + 1] = z1;
-            z[i * 3 + 2] = z2;
+            double r0 = r_0[i];
+            double r1 = r_1[i];
+            double r2 = r_2[i];
+            double z0 = inv_diag_00[i] * r0 + inv_diag_01[i] * r1 + inv_diag_02[i] * r2;
+            double z1 = inv_diag_10[i] * r0 + inv_diag_11[i] * r1 + inv_diag_12[i] * r2;
+            double z2 = inv_diag_20[i] * r0 + inv_diag_21[i] * r1 + inv_diag_22[i] * r2;
+            z_0[i] = z0;
+            z_1[i] = z1;
+            z_2[i] = z2;
 
             // rz_new = r · z
             rz_new += r0 * z0 + r1 * z1 + r2 * z2;
@@ -1179,14 +1509,13 @@ int pcg_solve(
         double beta = rz_new / rz;
 
         // p = z + beta * p pは所有節点について正しい値が入る
-#pragma omp parallel for
+#pragma acc parallel loop present(p_0, p_1, p_2, z_0, z_1, z_2)
         for (int i = 0; i < num_owned; i++)
         {
-            p[i * 3 + 0] = z[i * 3 + 0] + beta * p[i * 3 + 0];
-            p[i * 3 + 1] = z[i * 3 + 1] + beta * p[i * 3 + 1];
-            p[i * 3 + 2] = z[i * 3 + 2] + beta * p[i * 3 + 2];
+            p_0[i] = z_0[i] + beta * p_0[i];
+            p_1[i] = z_1[i] + beta * p_1[i];
+            p_2[i] = z_2[i] + beta * p_2[i];
         }
-
         rz = rz_new;
     }
 

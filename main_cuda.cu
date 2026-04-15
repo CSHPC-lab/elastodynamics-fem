@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_cuda_mpi.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80
+nvcc main_cuda.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
 sm_80はA100向け。H100、GH200ならsm_90。
 mpirun -np 4 ./a.out
 */
@@ -493,7 +493,7 @@ __global__ void kernel_spmv(
     int warp_id = tid / 32;
     int lane_id = tid % 32;
 
-    // 1つのWarpが、1つの行を担当する
+    // 1つのWarpが1つの行を担当する
     int i = start + warp_id;
 
     double s0 = 0.0, s1 = 0.0, s2 = 0.0;
@@ -513,22 +513,20 @@ __global__ void kernel_spmv(
             s1 += kval_10[p] * px + kval_11[p] * py + kval_12[p] * pz;
             s2 += kval_20[p] * px + kval_21[p] * py + kval_22[p] * pz;
         }
-    }
-
-    // Warp Reduction: 32スレッド分の s0, s1, s2 をレーン0に集約する
-    for (int offset = 16; offset > 0; offset /= 2)
-    {
-        s0 += __shfl_down_sync(0xffffffff, s0, offset);
-        s1 += __shfl_down_sync(0xffffffff, s1, offset);
-        s2 += __shfl_down_sync(0xffffffff, s2, offset);
-    }
-
-    // 代表スレッド（レーン0）のみが最終結果をグローバルメモリに書き込む
-    if (lane_id == 0)
-    {
-        Ap0[i] = s0;
-        Ap1[i] = s1;
-        Ap2[i] = s2;
+        // 32スレッド分の s0, s1, s2 をレーン0に集約する
+        for (int offset = 16; offset > 0; offset /= 2)
+        {
+            s0 += __shfl_down_sync(0xffffffff, s0, offset);
+            s1 += __shfl_down_sync(0xffffffff, s1, offset);
+            s2 += __shfl_down_sync(0xffffffff, s2, offset);
+        }
+        // 代表スレッド（レーン0）のみが最終結果をグローバルメモリに書き込む
+        if (lane_id == 0)
+        {
+            Ap0[i] = s0;
+            Ap1[i] = s1;
+            Ap2[i] = s2;
+        }
     }
 }
 

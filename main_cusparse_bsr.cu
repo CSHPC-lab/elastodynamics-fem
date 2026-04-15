@@ -1,7 +1,7 @@
 /*実行コマンド
 miyabiのみで実行可能
 module load nvidia/25.11
-nvcc main_cusparse_bsr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_90
+nvcc main_cusparse_bsr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_90 -lineinfo
 mpirun -np 4 ./a.out
 */
 

@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_cusparse_csr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80
+nvcc main_cusparse_csr.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -lcusparse -lcublas -arch=sm_80 -lineinfo
 mpirun -np 4 ./a.out
 */
 

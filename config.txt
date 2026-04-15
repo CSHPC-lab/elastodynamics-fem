@@ -1,6 +1,6 @@
 # Simulation parameters
-duration        0.1
-num_steps       10
+duration        20.0
+num_steps       2000
 sample_freq     1
 
 # Material properties

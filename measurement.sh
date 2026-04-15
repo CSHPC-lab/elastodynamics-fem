@@ -1,7 +1,7 @@
 #!/bin/bash -l
 
 #SBATCH --nodes=1
-#SBATCH --nodelist=lynx13
+#SBATCH --nodelist=lynx02
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=48
 #SBATCH --time=00:30:00
