@@ -9,7 +9,7 @@ export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 
 int main(int argc, char **argv)
 {
-    const double mesh_size = 0.4; // メッシュサイズの目安
+    const double mesh_size = 2.0; // メッシュサイズの目安
     const int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
 
     gmsh::initialize();

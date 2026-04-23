@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
-module load nvhpc/25.1
-mpicxx main_omp.cpp msh_reader.cpp -fopenmp
+module load aocc/5.0.0 aocl/aocc/5.0.0
+clang++ -O3 -march=znver2 -mtune=znver2 -mavx2 -mfma -ffp-contract=fast -fopenmp -funroll-loops -fvectorize -fslp-vectorize -flto=thin -DNDEBUG main_omp.cpp msh_reader.cpp -lm
 ./a.out
 */
 
@@ -12,7 +12,7 @@ mpicxx main_omp.cpp msh_reader.cpp -fopenmp
 #include <ctime>
 #include <sys/stat.h>
 #include <omp.h>
-#include <mpi.h>
+// #include <mpi.h>
 
 void calculate_dN(double dN[30], double r, double s, double t);
 void gauss_integrate(double dN0[30], double dN1[30], double dN2[30], double dN3[30]);
@@ -84,7 +84,7 @@ void bcrs_spmv_m(
     double *x,
     double *y);
 int pcg_solve(
-    MPI_Request *requests,
+    // MPI_Request *requests,
     int num_neighbors,
     int *neighbor_ranks,
     int *recv_starts,
@@ -125,15 +125,15 @@ void write_node_disp_csv(
 
 int main(int argc, char *argv[])
 {
-    MPI_Init(&argc, &argv);
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-    MPI_Request requests[100];
+    // MPI_Init(&argc, &argv);
+    // int rank, size;
+    // MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    // MPI_Comm_size(MPI_COMM_WORLD, &size);
+    // MPI_Request requests[100];
 
-    double start_time = MPI_Wtime();
+    double start_time = omp_get_wtime();
 
-    FEMMesh mesh = read_msh("column_4.msh", rank + 1);
+    FEMMesh mesh = read_msh("column_4.msh", 1);
     print_mesh_info(mesh);
 
     Config cfg;
@@ -319,12 +319,10 @@ int main(int argc, char *argv[])
 
         apply_bc_to_rhs(num_nodes, bc_flag, bc_val_u, bc_corr, rhs);
 
-        int iter = pcg_solve(requests, num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer,
+        int iter = pcg_solve(num_neighbors, neighbor_ranks, recv_starts, recv_counts, send_starts, send_counts, send_nodes_ptr, send_buffer,
                              num_inner, num_owned, num_nodes, bcrs_row_ptr, bcrs_col_ind, bcrs_kval, inv_diag, rhs, u_tmp, 1e-8, num_nodes * 3, r, z, p, Ap);
-        if (rank == 0)
-        {
-            std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
-        }
+
+        std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
 
         // 速度と加速度の更新（Newmark-β法） u,v,aは全節点について正しい値をもつ
 #pragma omp parallel for
@@ -420,18 +418,10 @@ int main(int argc, char *argv[])
         printf("CSV: %s\n", csv_filename);
     }
 
-    double end_time = MPI_Wtime();
+    double end_time = omp_get_wtime();
 
     double elapsed_time = end_time - start_time;
-    double max_elapsed_time;
-    MPI_Reduce(&elapsed_time, &max_elapsed_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-
-    if (rank == 0)
-    {
-        printf("Total elapsed time: %.2f seconds\n", max_elapsed_time);
-    }
-
-    MPI_Finalize();
+    printf("Total elapsed time: %.2f seconds\n", elapsed_time);
 
     return 0;
 }
@@ -951,7 +941,7 @@ double dot(int n, double *a, double *b)
 }
 
 int pcg_solve(
-    MPI_Request *request,
+    // MPI_Request *request,
     int num_neighbors,
     int *neighbor_ranks,
     int *recv_starts,
@@ -1033,11 +1023,6 @@ int pcg_solve(
         r_norm += r0 * r0 + r1 * r1 + r2 * r2;
     }
 
-    MPI_Iallreduce(MPI_IN_PLACE, &rz, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[0]);
-    MPI_Iallreduce(MPI_IN_PLACE, &b_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[1]);
-    MPI_Iallreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[2]);
-    MPI_Waitall(3, request, MPI_STATUSES_IGNORE);
-
     if (b_norm == 0.0)
         b_norm = 1.0;
 
@@ -1049,28 +1034,10 @@ int pcg_solve(
     int iter;
     for (iter = 0; iter < max_iter; iter++)
     {
-        // pは全節点について正しい必要があるので、ゴースト節点を送受信する。
-        for (int n = 0; n < num_neighbors; n++)
-        {
-            int send_start = send_starts[n];
-            // 送信用にまずはバッファにコピー
-#pragma omp parallel for
-            for (int i = 0; i < send_counts[n]; i++)
-            {
-                int node = send_nodes[send_start + i];
-                send_buffer[3 * (send_start + i) + 0] = p[node * 3 + 0];
-                send_buffer[3 * (send_start + i) + 1] = p[node * 3 + 1];
-                send_buffer[3 * (send_start + i) + 2] = p[node * 3 + 2];
-            }
-            // 送信
-            MPI_Isend(&send_buffer[3 * send_start], send_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            // 受信
-            MPI_Irecv(&p[recv_starts[n] * 3], recv_counts[n] * 3, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[num_neighbors + n]);
-        }
-
         double pAp = 0.0;
         // 通信が不要な内側の節点については先に計算しておく
-#pragma omp parallel for reduction(+ : pAp)
+        double spmv_start = omp_get_wtime();
+#pragma omp parallel for
         for (int i = 0; i < num_inner; i++)
         {
             // Ap = A * p Apは所有節点について正しい値が入る
@@ -1085,36 +1052,16 @@ int pcg_solve(
             Ap[i * 3 + 0] = y0;
             Ap[i * 3 + 1] = y1;
             Ap[i * 3 + 2] = y2;
-
-            // pAp = p · Ap
-            pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
         }
+        double spmv_time = omp_get_wtime() - spmv_start;
+        std::cout << "SpMV (inner) time: " << spmv_time << " seconds" << std::endl;
 
-        // ゴースト節点を待つ。pは全節点について正しい値が入る
-        MPI_Waitall(2 * num_neighbors, request, MPI_STATUSES_IGNORE);
-
-        // 通信が必要な外側の節点について計算
 #pragma omp parallel for reduction(+ : pAp)
-        for (int i = num_inner; i < num_owned; i++)
+        for (int i = 0; i < num_inner; i++)
         {
-            // Ap = A * p
-            double y0 = 0.0, y1 = 0.0, y2 = 0.0;
-            for (int p_ = row_ptr[i]; p_ < row_ptr[i + 1]; p_++)
-            {
-                int j = col_ind[p_];
-                y0 += kval[9 * p_ + 3 * 0 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 0 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 0 + 2] * p[j * 3 + 2];
-                y1 += kval[9 * p_ + 3 * 1 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 1 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 1 + 2] * p[j * 3 + 2];
-                y2 += kval[9 * p_ + 3 * 2 + 0] * p[j * 3 + 0] + kval[9 * p_ + 3 * 2 + 1] * p[j * 3 + 1] + kval[9 * p_ + 3 * 2 + 2] * p[j * 3 + 2];
-            }
-            Ap[i * 3 + 0] = y0;
-            Ap[i * 3 + 1] = y1;
-            Ap[i * 3 + 2] = y2;
-
             // pAp = p · Ap
-            pAp += p[i * 3 + 0] * y0 + p[i * 3 + 1] * y1 + p[i * 3 + 2] * y2;
+            pAp += p[i * 3 + 0] * Ap[i * 3 + 0] + p[i * 3 + 1] * Ap[i * 3 + 1] + p[i * 3 + 2] * Ap[i * 3 + 2];
         }
-
-        MPI_Allreduce(MPI_IN_PLACE, &pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         // alpha = rz / (p · Ap)
         double alpha = rz / pAp;
@@ -1145,8 +1092,6 @@ int pcg_solve(
             r_norm += r_i_0 * r_i_0 + r_i_1 * r_i_1 + r_i_2 * r_i_2;
         }
 
-        MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
         // 収束判定
         if (r_norm / b_norm < tol * tol)
         {
@@ -1172,8 +1117,6 @@ int pcg_solve(
             // rz_new = r · z
             rz_new += r0 * z0 + r1 * z1 + r2 * z2;
         }
-
-        MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
         // beta = rz_new / rz
         double beta = rz_new / rz;

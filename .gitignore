@@ -2,12 +2,6 @@
 *.vtk
 *.msh
 *.log
-results/*
-dyna_*
-*.stats
-column_fistr_4.*
-column_fistr.res.*
-FSTR.*
-hecmw_part.log
-part.inp
+*.csv
 *.err
+*.stats

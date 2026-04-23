@@ -1,6 +1,6 @@
 # Simulation parameters
-duration        20.0
-num_steps       2000
+duration        40.0
+num_steps       4000
 sample_freq     1
 
 # Material properties
@@ -13,3 +13,5 @@ target_node     1
 force_node      1
 force_dof       2
 force_magnitude 0.0
+
+ratio           1.0

@@ -1,9 +1,10 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_cuda.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
+nvcc main_recursive.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
 sm_80はA100向け。H100、GH200ならsm_90。
 mpirun -np 4 ./a.out
+増分解析バージョン
 */
 
 #include "msh_reader.hpp"
@@ -20,6 +21,8 @@ mpirun -np 4 ./a.out
 #include <thrust/reduce.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/tuple.h>
+#include <thrust/gather.h>
+#include <thrust/sequence.h>
 
 // ============================================================
 // CUDA エラーチェックマクロ
@@ -53,7 +56,7 @@ struct DeviceData
 
     // COO行列
     int *coo_row, *coo_col;
-    double *kmat_coo_val, *mmat_coo_val;
+    double *kmat_coo_val, *mmat_coo_val, *kemat_coo_val;
 
     // BCRS 行列
     int *row_ptr, *col_ind;
@@ -61,6 +64,9 @@ struct DeviceData
     double *kval_10, *kval_11, *kval_12;
     double *kval_20, *kval_21, *kval_22;
     double *mval;
+    double *keval_00, *keval_01, *keval_02;
+    double *keval_10, *keval_11, *keval_12;
+    double *keval_20, *keval_21, *keval_22;
 
     // 境界条件
     int *bc_flag;
@@ -78,10 +84,13 @@ struct DeviceData
     double *v_tmp_0, *v_tmp_1, *v_tmp_2;
     double *a_tmp_0, *a_tmp_1, *a_tmp_2;
     double *u_prv_0, *u_prv_1, *u_prv_2;
+    double *delta_u_0, *delta_u_1, *delta_u_2;
 
     // 右辺・一時ベクトル
     double *rhs_0, *rhs_1, *rhs_2;
     double *tmp_0, *tmp_1, *tmp_2;
+    double *rhs_original_0, *rhs_original_1, *rhs_original_2;
+    double *f_int_0, *f_int_1, *f_int_2;
 
     // PCG ベクトル
     double *r_0, *r_1, *r_2;
@@ -90,7 +99,7 @@ struct DeviceData
     double *Ap_0, *Ap_1, *Ap_2;
 
     // 境界条件の値
-    double *bc_val_u, *bc_val_v, *bc_val_a;
+    double *bc_val_u;
 
     // MPI 通信用
     int *send_nodes;
@@ -124,8 +133,16 @@ __constant__ double c_dN3[30];
 // CUDA カーネル
 // ============================================================
 
+// x^(i+1)=x^(i)+ratio*u^(i)を基準にKを計算し、初期配置でMを計算するカーネル
+// node_coordsはx^(i)、ref_node_coordsはx^(0)、delta_u_0、delta_u_1、delta_u_2がdu^(i)を表す。
+// つまり、変形前のref_node_coordsを入れないといけない。
 __global__ void construct_mat(
     const double *__restrict__ node_coords,
+    const double *__restrict__ ref_node_coords,
+    const double *__restrict__ delta_u_0,
+    const double *__restrict__ delta_u_1,
+    const double *__restrict__ delta_u_2,
+    const double ratio,
     const int *__restrict__ ele_nodes,
     const int num_elements,
     const double lambda,
@@ -134,14 +151,13 @@ __global__ void construct_mat(
     const double dt,
     double *__restrict__ kmat_coo_val,
     double *__restrict__ mmat_coo_val,
+    double *__restrict__ kemat_coo_val,
     int *__restrict__ coo_row,
     int *__restrict__ coo_col)
 {
     const int elem = blockIdx.x * blockDim.x + threadIdx.x;
     if (elem >= num_elements)
         return;
-
-    const double mass_coeff = 96.0 * rho / (dt * dt);
 
     // ノードインデックス
     int nidx[10];
@@ -150,14 +166,18 @@ __global__ void construct_mat(
         nidx[i] = ele_nodes[elem * 10 + i];
 
     // ヤコビアン
-    double invJ[9], detJ;
+    double invJ[9], detJ, detJ_m;
     {
         double J[9], x0[3];
-        for (int d = 0; d < 3; d++)
-            x0[d] = node_coords[nidx[0] * 3 + d];
+        x0[0] = node_coords[nidx[0] * 3 + 0] + ratio * delta_u_0[nidx[0]];
+        x0[1] = node_coords[nidx[0] * 3 + 1] + ratio * delta_u_1[nidx[0]];
+        x0[2] = node_coords[nidx[0] * 3 + 2] + ratio * delta_u_2[nidx[0]];
         for (int i = 0; i < 3; i++)
-            for (int d = 0; d < 3; d++)
-                J[3 * i + d] = node_coords[nidx[i + 1] * 3 + d] - x0[d];
+        {
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] + ratio * delta_u_0[nidx[i + 1]] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] + ratio * delta_u_1[nidx[i + 1]] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] + ratio * delta_u_2[nidx[i + 1]] - x0[2];
+        }
         detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
                J[1] * (J[5] * J[6] - J[3] * J[8]) +
                J[2] * (J[3] * J[7] - J[4] * J[6]);
@@ -170,8 +190,18 @@ __global__ void construct_mat(
         invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
         invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
         invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+
+        for (int d = 0; d < 3; d++)
+            x0[d] = ref_node_coords[nidx[0] * 3 + d];
+        for (int i = 0; i < 3; i++)
+            for (int d = 0; d < 3; d++)
+                J[3 * i + d] = ref_node_coords[nidx[i + 1] * 3 + d] - x0[d];
+        detJ_m = J[0] * (J[4] * J[8] - J[5] * J[7]) +
+                 J[1] * (J[5] * J[6] - J[3] * J[8]) +
+                 J[2] * (J[3] * J[7] - J[4] * J[6]);
     }
     const double detJ_24 = detJ / 24.0;
+    const double mass_coeff = 4.0 * rho / (dt * dt) * detJ_m;
 
     // 形状関数勾配の物理座標変換
     double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
@@ -223,18 +253,21 @@ __global__ void construct_mat(
                 }
             }
 
+// 書き出し
+#pragma unroll
+            for (int k = 0; k < 9; k++)
+            {
+                kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+                kemat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+            }
+
             // 質量行列の対角寄与
             const double mij = c_mmat[ij];
 #pragma unroll
             for (int a = 0; a < 3; a++)
-                kab[3 * a + a] += mass_coeff * mij;
+                kemat_coo_val[9 * (base + ij) + 3 * a + a] += mass_coeff * mij;
 
-// 書き出し
-#pragma unroll
-            for (int k = 0; k < 9; k++)
-                kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
-
-            mmat_coo_val[base + ij] = rho * mij * detJ;
+            mmat_coo_val[base + ij] = rho * mij * detJ_m;
             coo_row[base + ij] = nidx[i];
             coo_col[base + ij] = nidx[j];
         }
@@ -246,13 +279,17 @@ struct BlockVal
 {
     double k[9];
     double m;
+    double ke[9];
 };
 
 __host__ __device__ BlockVal operator+(const BlockVal &a, const BlockVal &b)
 {
     BlockVal c;
     for (int i = 0; i < 9; i++)
+    {
         c.k[i] = a.k[i] + b.k[i];
+        c.ke[i] = a.ke[i] + b.ke[i];
+    }
     c.m = a.m + b.m;
     return c;
 }
@@ -268,6 +305,7 @@ __global__ void pack_coo(
     const int *__restrict__ coo_col,
     const double *__restrict__ kmat_val,
     const double *__restrict__ mmat_val,
+    const double *__restrict__ kemat_val,
     int64_t *__restrict__ keys,
     BlockVal *__restrict__ vals,
     int nnz, int num_nodes)
@@ -277,7 +315,10 @@ __global__ void pack_coo(
         return;
     keys[k] = (int64_t)coo_row[k] * num_nodes + coo_col[k];
     for (int i = 0; i < 9; i++)
+    {
         vals[k].k[i] = kmat_val[9 * k + i];
+        vals[k].ke[i] = kemat_val[9 * k + i];
+    }
     vals[k].m = mmat_val[k];
 }
 
@@ -289,6 +330,7 @@ __global__ void unpack_bcrs(
     int *__restrict__ out_col,
     double *__restrict__ out_kmat,
     double *__restrict__ out_mmat,
+    double *__restrict__ out_kemat,
     int nnz_bcrs, int num_nodes)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -297,7 +339,10 @@ __global__ void unpack_bcrs(
     out_row[k] = (int)(keys[k] / num_nodes);
     out_col[k] = (int)(keys[k] % num_nodes);
     for (int i = 0; i < 9; i++)
+    {
         out_kmat[9 * k + i] = vals[k].k[i];
+        out_kemat[9 * k + i] = vals[k].ke[i];
+    }
     out_mmat[k] = vals[k].m;
 }
 
@@ -305,11 +350,15 @@ __global__ void unpack_bcrs_kernel(
     const int *__restrict__ coo_col,
     const double *__restrict__ kmat_coo_val,
     const double *__restrict__ mmat_coo_val,
+    const double *__restrict__ kemat_coo_val,
     int *__restrict__ bcrs_col_ind,
     double *__restrict__ kval_00, double *__restrict__ kval_01, double *__restrict__ kval_02,
     double *__restrict__ kval_10, double *__restrict__ kval_11, double *__restrict__ kval_12,
     double *__restrict__ kval_20, double *__restrict__ kval_21, double *__restrict__ kval_22,
     double *__restrict__ bcrs_mval,
+    double *__restrict__ keval_00, double *__restrict__ keval_01, double *__restrict__ keval_02,
+    double *__restrict__ keval_10, double *__restrict__ keval_11, double *__restrict__ keval_12,
+    double *__restrict__ keval_20, double *__restrict__ keval_21, double *__restrict__ keval_22,
     int nnz_bcrs)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -328,6 +377,16 @@ __global__ void unpack_bcrs_kernel(
     kval_21[k] = src[7];
     kval_22[k] = src[8];
     bcrs_mval[k] = mmat_coo_val[k];
+    const double *ksrc = &kemat_coo_val[9 * k];
+    keval_00[k] = ksrc[0];
+    keval_01[k] = ksrc[1];
+    keval_02[k] = ksrc[2];
+    keval_10[k] = ksrc[3];
+    keval_11[k] = ksrc[4];
+    keval_12[k] = ksrc[5];
+    keval_20[k] = ksrc[6];
+    keval_21[k] = ksrc[7];
+    keval_22[k] = ksrc[8];
 }
 
 __global__ void count_rows_kernel(
@@ -477,7 +536,6 @@ __global__ void build_block_jacobi(
 // --- Newmark-β RHS の一時ベクトル構築 ---
 __global__ void kernel_build_newmark_tmp(
     int num_nodes, double dt_inv2, double dt_inv,
-    const double *u0, const double *u1, const double *u2,
     const double *v0, const double *v1, const double *v2,
     const double *a0, const double *a1, const double *a2,
     double *t0, double *t1, double *t2)
@@ -485,9 +543,9 @@ __global__ void kernel_build_newmark_tmp(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= num_nodes)
         return;
-    t0[i] = u0[i] * 4.0 * dt_inv2 + v0[i] * 4.0 * dt_inv + a0[i];
-    t1[i] = u1[i] * 4.0 * dt_inv2 + v1[i] * 4.0 * dt_inv + a1[i];
-    t2[i] = u2[i] * 4.0 * dt_inv2 + v2[i] * 4.0 * dt_inv + a2[i];
+    t0[i] = v0[i] * 4.0 * dt_inv + a0[i];
+    t1[i] = v1[i] * 4.0 * dt_inv + a1[i];
+    t2[i] = v2[i] * 4.0 * dt_inv + a2[i];
 }
 
 // --- BCRS 質量行列 SpMV: y = M * x ---
@@ -515,9 +573,9 @@ __global__ void kernel_bcrs_spmv_m(
 }
 
 // --- 境界条件を右辺に適用（自由節点の補正） ---
-__global__ void kernel_apply_bc_to_rhs_free(
+__global__ void kernel_apply_bc_to_rhs(
     int num_nodes,
-    const double *bc_val,
+    const double *bc_val, const int *bc_flag,
     const double *bc_corr_00, const double *bc_corr_01, const double *bc_corr_02,
     const double *bc_corr_10, const double *bc_corr_11, const double *bc_corr_12,
     const double *bc_corr_20, const double *bc_corr_21, const double *bc_corr_22,
@@ -530,16 +588,6 @@ __global__ void kernel_apply_bc_to_rhs_free(
     rhs_0[i] -= bc_corr_00[i] * bv0 + bc_corr_01[i] * bv1 + bc_corr_02[i] * bv2;
     rhs_1[i] -= bc_corr_10[i] * bv0 + bc_corr_11[i] * bv1 + bc_corr_12[i] * bv2;
     rhs_2[i] -= bc_corr_20[i] * bv0 + bc_corr_21[i] * bv1 + bc_corr_22[i] * bv2;
-}
-
-// --- 境界条件を右辺に適用（拘束節点の設定） ---
-__global__ void kernel_apply_bc_to_rhs_constrained(
-    int num_nodes, const int *bc_flag, const double *bc_val,
-    double *rhs_0, double *rhs_1, double *rhs_2)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= num_nodes)
-        return;
     if (bc_flag[i])
     {
         rhs_0[i] = bc_val[0];
@@ -553,8 +601,8 @@ __global__ void kernel_apply_bc_to_rhs_constrained(
 // ブロックサイズは最大1024（Warp数最大32）を想定
 __global__ void kernel_dot3_reduce(
     int start, int end,
-    const double *__restrict__ a0, const double *__restrict__ a1, const double *__restrict__ a2,
-    const double *__restrict__ b0, const double *__restrict__ b1, const double *__restrict__ b2,
+    const double *a0, const double *a1, const double *a2,
+    const double *b0, const double *b1, const double *b2,
     double *__restrict__ result)
 {
     // 各Warpの合計値を保存するための共有メモリ（最大32個で十分）
@@ -813,7 +861,7 @@ __global__ void kernel_pack_send_buffer(
     sb2[offset + i] = p2[node];
 }
 
-// --- SpMV ---
+// --- SpMV (1つのWarpが1行を担当するので、行数×32個のthreadが必要) ---
 __global__ void kernel_spmv(
     int start, int end,
     const int *__restrict__ row_ptr, const int *__restrict__ col_ind,
@@ -864,11 +912,27 @@ __global__ void kernel_spmv(
     }
 }
 
+__global__ void update_coords(
+    const double *__restrict__ ref_node_coords,
+    const double *__restrict__ u_tmp_0,
+    const double *__restrict__ u_tmp_1,
+    const double *__restrict__ u_tmp_2,
+    double *__restrict__ node_coords,
+    int num_nodes)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_nodes)
+        return;
+
+    node_coords[i * 3 + 0] = ref_node_coords[i * 3 + 0] + u_tmp_0[i];
+    node_coords[i * 3 + 1] = ref_node_coords[i * 3 + 1] + u_tmp_1[i];
+    node_coords[i * 3 + 2] = ref_node_coords[i * 3 + 2] + u_tmp_2[i];
+}
+
 // --- Newmark-β 更新カーネル ---
 __global__ void kernel_newmark_update(
     int num_nodes, double dt, double dt_inv, double dt_inv2,
-    const int *bc_flag,
-    const double *bc_val_u, const double *bc_val_v, const double *bc_val_a,
+    const int *bc_flag, const double *bc_val_u,
     double *u_tmp_0, double *u_tmp_1, double *u_tmp_2,
     double *u_prv_0, double *u_prv_1, double *u_prv_2,
     double *v_tmp_0, double *v_tmp_1, double *v_tmp_2,
@@ -883,25 +947,19 @@ __global__ void kernel_newmark_update(
     double v_old_0 = v_tmp_0[i], v_old_1 = v_tmp_1[i], v_old_2 = v_tmp_2[i];
     double a_old_0 = a_tmp_0[i], a_old_1 = a_tmp_1[i], a_old_2 = a_tmp_2[i];
 
+    if (bc_flag[i])
+    {
+        u_new_0 = bc_val_u[0];
+        u_new_1 = bc_val_u[1];
+        u_new_2 = bc_val_u[2];
+    }
+
     double a_new_0 = (u_new_0 - u_old_0) * 4.0 * dt_inv2 - v_old_0 * 4.0 * dt_inv - a_old_0;
     double a_new_1 = (u_new_1 - u_old_1) * 4.0 * dt_inv2 - v_old_1 * 4.0 * dt_inv - a_old_1;
     double a_new_2 = (u_new_2 - u_old_2) * 4.0 * dt_inv2 - v_old_2 * 4.0 * dt_inv - a_old_2;
     double v_new_0 = v_old_0 + (a_new_0 + a_old_0) * dt / 2.0;
     double v_new_1 = v_old_1 + (a_new_1 + a_old_1) * dt / 2.0;
     double v_new_2 = v_old_2 + (a_new_2 + a_old_2) * dt / 2.0;
-
-    if (bc_flag[i])
-    {
-        u_new_0 = bc_val_u[0];
-        u_new_1 = bc_val_u[1];
-        u_new_2 = bc_val_u[2];
-        v_new_0 = bc_val_v[0];
-        v_new_1 = bc_val_v[1];
-        v_new_2 = bc_val_v[2];
-        a_new_0 = bc_val_a[0];
-        a_new_1 = bc_val_a[1];
-        a_new_2 = bc_val_a[2];
-    }
 
     u_prv_0[i] = u_new_0;
     u_prv_1[i] = u_new_1;
@@ -967,24 +1025,32 @@ void gauss_integrate(double dN0[30], double dN1[30], double dN2[30], double dN3[
 int sort_and_merge_bcoo(
     int nnz_coo, int num_nodes,
     int *coo_row, int *coo_col,
-    double *kmat_coo_val, double *mmat_coo_val)
+    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val)
 {
-    // 1. pack: (row,col) → 64ビットキー、値 → BlockVal
     thrust::device_vector<int64_t> keys(nnz_coo);
     thrust::device_vector<BlockVal> vals(nnz_coo);
 
     int block = 256;
     int grid = (nnz_coo + block - 1) / block;
     pack_coo<<<grid, block>>>(
-        coo_row, coo_col, kmat_coo_val, mmat_coo_val,
+        coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
         thrust::raw_pointer_cast(keys.data()),
         thrust::raw_pointer_cast(vals.data()),
         nnz_coo, num_nodes);
+    CUDA_CHECK(cudaGetLastError());
 
-    // 2. キーでソート (値も一緒に並び替わる)
-    thrust::sort_by_key(keys.begin(), keys.end(), vals.begin());
+    // ★変更点★ 軽い (int64, int) ペアだけでソートする
+    thrust::device_vector<int> perm(nnz_coo);
+    thrust::sequence(perm.begin(), perm.end());
+    thrust::sort_by_key(keys.begin(), keys.end(), perm.begin());
 
-    // 3. 重複キーを合算
+    // perm に従って BlockVal を並び替え（ここは radix_sort を介さないので安全）
+    thrust::device_vector<BlockVal> vals_sorted(nnz_coo);
+    thrust::gather(perm.begin(), perm.end(),
+                   vals.begin(), vals_sorted.begin());
+    vals.swap(vals_sorted);
+
+    // 以降は今までと同じ。reduce_by_key は radix_sort を使わないので BlockVal で OK
     thrust::device_vector<int64_t> keys_out(nnz_coo);
     thrust::device_vector<BlockVal> vals_out(nnz_coo);
 
@@ -996,12 +1062,11 @@ int sort_and_merge_bcoo(
 
     int nnz_bcrs = end.first - keys_out.begin();
 
-    // 4. unpack: 元の配列形式に戻す
     grid = (nnz_bcrs + block - 1) / block;
     unpack_bcrs<<<grid, block>>>(
         thrust::raw_pointer_cast(keys_out.data()),
         thrust::raw_pointer_cast(vals_out.data()),
-        coo_row, coo_col, kmat_coo_val, mmat_coo_val,
+        coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
         nnz_bcrs, num_nodes);
 
     return nnz_bcrs;
@@ -1027,24 +1092,31 @@ double inverse_3_3_mat(double mat[9], double inv_mat[9])
 
 void build_bcrs(
     int *coo_row, int *coo_col,
-    double *kmat_coo_val, double *mmat_coo_val,
+    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val,
     int nnz_bcrs, int num_nodes,
     int *bcrs_row_ptr, int *bcrs_col_ind,
     double *kval_00, double *kval_01, double *kval_02,
     double *kval_10, double *kval_11, double *kval_12,
     double *kval_20, double *kval_21, double *kval_22,
-    double *bcrs_mval)
+    double *bcrs_mval,
+    double *keval_00, double *keval_01, double *keval_02,
+    double *keval_10, double *keval_11, double *keval_12,
+    double *keval_20, double *keval_21, double *keval_22)
 {
     int block = 256;
     int grid = (nnz_bcrs + block - 1) / block;
 
     unpack_bcrs_kernel<<<grid, block>>>(
-        coo_col, kmat_coo_val, mmat_coo_val,
+        coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
         bcrs_col_ind,
         kval_00, kval_01, kval_02,
         kval_10, kval_11, kval_12,
         kval_20, kval_21, kval_22,
-        bcrs_mval, nnz_bcrs);
+        bcrs_mval,
+        keval_00, keval_01, keval_02,
+        keval_10, keval_11, keval_12,
+        keval_20, keval_21, keval_22,
+        nnz_bcrs);
 
     cudaMemset(bcrs_row_ptr, 0, sizeof(int) * (num_nodes + 1));
     count_rows_kernel<<<grid, block>>>(coo_row, bcrs_row_ptr, nnz_bcrs);
@@ -1053,6 +1125,60 @@ void build_bcrs(
         thrust::device_pointer_cast(bcrs_row_ptr + 1),
         thrust::device_pointer_cast(bcrs_row_ptr + 1 + num_nodes),
         thrust::device_pointer_cast(bcrs_row_ptr + 1));
+}
+
+void write_vtk_displacement(
+    const char *filename, double *node_coords, int num_nodes,
+    int *ele_nodes, int num_elements, double *displacement_0, double *displacement_1, double *displacement_2, double total_time)
+{
+    FILE *fp = fopen(filename, "w");
+    fprintf(fp, "# vtk DataFile Version 2.0\n");
+    fprintf(fp, "FEM displacement result\n");
+    fprintf(fp, "ASCII\n");
+    fprintf(fp, "DATASET UNSTRUCTURED_GRID\n");
+    fprintf(fp, "\nFIELD FieldData 1\n");
+    fprintf(fp, "TOTALTIME 1 1 double\n");
+    fprintf(fp, "%.10e\n", total_time);
+    fprintf(fp, "POINTS %d double\n", num_nodes);
+    for (int i = 0; i < num_nodes; i++)
+        fprintf(fp, "%.15e %.15e %.15e\n", node_coords[i * 3 + 0], node_coords[i * 3 + 1], node_coords[i * 3 + 2]);
+    int cells_size = num_elements * 11;
+    fprintf(fp, "CELLS %d %d\n", num_elements, cells_size);
+    for (int e = 0; e < num_elements; e++)
+    {
+        fprintf(fp, "10");
+        for (int i = 0; i < 10; i++)
+            fprintf(fp, " %d", ele_nodes[e * 10 + i]);
+        fprintf(fp, "\n");
+    }
+    fprintf(fp, "CELL_TYPES %d\n", num_elements);
+    for (int e = 0; e < num_elements; e++)
+        fprintf(fp, "24\n");
+    fprintf(fp, "POINT_DATA %d\n", num_nodes);
+    fprintf(fp, "SCALARS NODE_ID int 1\n");
+    fprintf(fp, "LOOKUP_TABLE default\n");
+    for (int i = 0; i < num_nodes; i++)
+        fprintf(fp, "%d\n", i + 1);
+    fprintf(fp, "VECTORS DISPLACEMENT double\n");
+    for (int i = 0; i < num_nodes; i++)
+        fprintf(fp, "%.15e %.15e %.15e\n", displacement_0[i], displacement_1[i], displacement_2[i]);
+    fclose(fp);
+}
+
+void write_node_disp_csv(
+    const char *filename, double *u, int num_steps, int sample_freq, double dt)
+{
+    FILE *csv_fp = fopen(filename, "w");
+    fprintf(csv_fp, "time,disp_x,disp_y,disp_z,disp_mag\n");
+    for (int step = 0; step <= num_steps; step += sample_freq)
+    {
+        double t = step * dt;
+        int idx = step / sample_freq;
+        double ux = u[idx * 3 + 0], uy = u[idx * 3 + 1], uz = u[idx * 3 + 2];
+        double mag = sqrt(ux * ux + uy * uy + uz * uz);
+        fprintf(csv_fp, "%.10e,%.10e,%.10e,%.10e,%.10e\n", t, ux, uy, uz, mag);
+    }
+    fclose(csv_fp);
 }
 
 int pcg_solve(
@@ -1075,20 +1201,20 @@ int pcg_solve(
 
     // リダクション用のデバイスメモリ（3要素: rz, b_norm, r_norm）
     double h_vals[3] = {0.0, 0.0, 0.0};
-    CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 3 * sizeof(double)));
+    CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, 3 * sizeof(double)));
 
     // --- 初期化: r=b-Ax, z=C^{-1}r, p=z ---
     kernel_pcg_init<<<grid_owned, BLOCK_SIZE>>>(
         num_owned,
         dd.row_ptr, dd.col_ind,
-        dd.kval_00, dd.kval_01, dd.kval_02,
-        dd.kval_10, dd.kval_11, dd.kval_12,
-        dd.kval_20, dd.kval_21, dd.kval_22,
+        dd.keval_00, dd.keval_01, dd.keval_02,
+        dd.keval_10, dd.keval_11, dd.keval_12,
+        dd.keval_20, dd.keval_21, dd.keval_22,
         dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
         dd.inv_diag_10, dd.inv_diag_11, dd.inv_diag_12,
         dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22,
         dd.rhs_0, dd.rhs_1, dd.rhs_2,
-        dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
+        dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
         dd.Ap_0, dd.Ap_1, dd.Ap_2,
         dd.r_0, dd.r_1, dd.r_2,
         dd.z_0, dd.z_1, dd.z_2,
@@ -1103,14 +1229,12 @@ int pcg_solve(
     MPI_Iallreduce(MPI_IN_PLACE, &b_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[1]);
     MPI_Iallreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[2]);
     MPI_Waitall(3, request, MPI_STATUSES_IGNORE);
-
-    if (b_norm == 0.0)
-        b_norm = 1.0;
+    if (b_norm < 1e-16)
+        return 0;
     if (r_norm / b_norm < tol * tol)
         return 0;
 
     int iter;
-    double iter_start_time = MPI_Wtime();
     for (iter = 0; iter < max_iter; iter++)
     {
         // --- ゴースト節点の通信 ---
@@ -1144,7 +1268,7 @@ int pcg_solve(
 
         // --- 内側節点の SpMV + pAp ---
         double h_pAp = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
 
         if (num_inner > 0)
         {
@@ -1152,11 +1276,17 @@ int pcg_solve(
             kernel_spmv<<<grid_inner, BLOCK_SIZE>>>(
                 0, num_inner,
                 dd.row_ptr, dd.col_ind,
-                dd.kval_00, dd.kval_01, dd.kval_02,
-                dd.kval_10, dd.kval_11, dd.kval_12,
-                dd.kval_20, dd.kval_21, dd.kval_22,
+                dd.keval_00, dd.keval_01, dd.keval_02,
+                dd.keval_10, dd.keval_11, dd.keval_12,
+                dd.keval_20, dd.keval_21, dd.keval_22,
                 dd.p_0, dd.p_1, dd.p_2,
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            kernel_dot3_reduce<<<grid_inner, BLOCK_SIZE>>>(
+                0, num_inner,
+                dd.p_0, dd.p_1, dd.p_2,
+                dd.Ap_0, dd.Ap_1, dd.Ap_2,
+                &dd.d_reduce[0]);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
@@ -1171,20 +1301,20 @@ int pcg_solve(
             kernel_spmv<<<grid_bdr, BLOCK_SIZE>>>(
                 num_inner, num_owned,
                 dd.row_ptr, dd.col_ind,
-                dd.kval_00, dd.kval_01, dd.kval_02,
-                dd.kval_10, dd.kval_11, dd.kval_12,
-                dd.kval_20, dd.kval_21, dd.kval_22,
+                dd.keval_00, dd.keval_01, dd.keval_02,
+                dd.keval_10, dd.keval_11, dd.keval_12,
+                dd.keval_20, dd.keval_21, dd.keval_22,
                 dd.p_0, dd.p_1, dd.p_2,
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
             CUDA_CHECK(cudaDeviceSynchronize());
+            kernel_dot3_reduce<<<grid_bdr, BLOCK_SIZE>>>(
+                num_inner, num_owned,
+                dd.p_0, dd.p_1, dd.p_2,
+                dd.Ap_0, dd.Ap_1, dd.Ap_2,
+                &dd.d_reduce[0]);
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        kernel_dot3_reduce<<<grid_owned, BLOCK_SIZE>>>(
-            0, num_owned,
-            dd.p_0, dd.p_1, dd.p_2,
-            dd.Ap_0, dd.Ap_1, dd.Ap_2,
-            &dd.d_reduce[0]);
-        CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(&h_pAp, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
 
@@ -1194,10 +1324,10 @@ int pcg_solve(
         kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
             num_nodes, alpha,
             dd.p_0, dd.p_1, dd.p_2,
-            dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
+            dd.delta_u_0, dd.delta_u_1, dd.delta_u_2);
 
         // r -= alpha * Ap, r_norm計算
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
         kernel_update_r<<<grid_owned, BLOCK_SIZE>>>(
             num_owned, alpha,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
@@ -1216,7 +1346,7 @@ int pcg_solve(
 
         // z = C^{-1}r, rz_new計算
         double rz_new = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
         kernel_precond_and_rz<<<grid_owned, BLOCK_SIZE>>>(
             num_owned,
             dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
@@ -1241,60 +1371,6 @@ int pcg_solve(
     }
 
     return iter;
-}
-
-void write_vtk_displacement(
-    const char *filename, double *node_coords, int num_nodes,
-    int *ele_nodes, int num_elements, double *displacement, double total_time)
-{
-    FILE *fp = fopen(filename, "w");
-    fprintf(fp, "# vtk DataFile Version 2.0\n");
-    fprintf(fp, "FEM displacement result\n");
-    fprintf(fp, "ASCII\n");
-    fprintf(fp, "DATASET UNSTRUCTURED_GRID\n");
-    fprintf(fp, "\nFIELD FieldData 1\n");
-    fprintf(fp, "TOTALTIME 1 1 double\n");
-    fprintf(fp, "%.10e\n", total_time);
-    fprintf(fp, "POINTS %d double\n", num_nodes);
-    for (int i = 0; i < num_nodes; i++)
-        fprintf(fp, "%.15e %.15e %.15e\n", node_coords[i * 3 + 0], node_coords[i * 3 + 1], node_coords[i * 3 + 2]);
-    int cells_size = num_elements * 11;
-    fprintf(fp, "CELLS %d %d\n", num_elements, cells_size);
-    for (int e = 0; e < num_elements; e++)
-    {
-        fprintf(fp, "10");
-        for (int i = 0; i < 10; i++)
-            fprintf(fp, " %d", ele_nodes[e * 10 + i]);
-        fprintf(fp, "\n");
-    }
-    fprintf(fp, "CELL_TYPES %d\n", num_elements);
-    for (int e = 0; e < num_elements; e++)
-        fprintf(fp, "24\n");
-    fprintf(fp, "POINT_DATA %d\n", num_nodes);
-    fprintf(fp, "SCALARS NODE_ID int 1\n");
-    fprintf(fp, "LOOKUP_TABLE default\n");
-    for (int i = 0; i < num_nodes; i++)
-        fprintf(fp, "%d\n", i + 1);
-    fprintf(fp, "VECTORS DISPLACEMENT double\n");
-    for (int i = 0; i < num_nodes; i++)
-        fprintf(fp, "%.15e %.15e %.15e\n", displacement[i * 3 + 0], displacement[i * 3 + 1], displacement[i * 3 + 2]);
-    fclose(fp);
-}
-
-void write_node_disp_csv(
-    const char *filename, double *u, int num_steps, int sample_freq, double dt)
-{
-    FILE *csv_fp = fopen(filename, "w");
-    fprintf(csv_fp, "time,disp_x,disp_y,disp_z,disp_mag\n");
-    for (int step = 0; step <= num_steps; step += sample_freq)
-    {
-        double t = step * dt;
-        int idx = step / sample_freq;
-        double ux = u[idx * 3 + 0], uy = u[idx * 3 + 1], uz = u[idx * 3 + 2];
-        double mag = sqrt(ux * ux + uy * uy + uz * uz);
-        fprintf(csv_fp, "%.10e,%.10e,%.10e,%.10e,%.10e\n", t, ux, uy, uz, mag);
-    }
-    fclose(csv_fp);
 }
 
 // ============================================================
@@ -1358,6 +1434,7 @@ int main(int argc, char *argv[])
     int force_node = get_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
+    double ratio = cfg.get_double("ratio");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
 
@@ -1420,8 +1497,11 @@ int main(int argc, char *argv[])
     }
 
     double *u = new double[(num_steps / sample_freq + 1) * 3]();
+    double *u_0 = new double[num_nodes]();
+    double *u_1 = new double[num_nodes]();
+    double *u_2 = new double[num_nodes]();
     int *bc_flag = new int[num_nodes]();
-    double bc_val_u[3], bc_val_v[3], bc_val_a[3];
+    double bc_val_u[3];
 
     // 境界条件
 #pragma omp parallel for
@@ -1448,18 +1528,37 @@ int main(int argc, char *argv[])
     // 剛性行列、質量行列計算
     dd.kmat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
     dd.mmat_coo_val = device_alloc_zero<double>(100 * num_elements);
+    dd.kemat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
     dd.coo_row = device_alloc_zero<int>(100 * num_elements);
     dd.coo_col = device_alloc_zero<int>(100 * num_elements);
 
     // 基準となる座標をコピーして記録
     dd.ref_node_coords = device_alloc_copy(node_coords, num_nodes * 3);
 
+    // 変位・速度・加速度 (ゼロ初期化)
+    dd.u_tmp_0 = device_alloc_zero<double>(num_nodes);
+    dd.u_tmp_1 = device_alloc_zero<double>(num_nodes);
+    dd.u_tmp_2 = device_alloc_zero<double>(num_nodes);
+    dd.v_tmp_0 = device_alloc_zero<double>(num_nodes);
+    dd.v_tmp_1 = device_alloc_zero<double>(num_nodes);
+    dd.v_tmp_2 = device_alloc_zero<double>(num_nodes);
+    dd.a_tmp_0 = device_alloc_zero<double>(num_nodes);
+    dd.a_tmp_1 = device_alloc_zero<double>(num_nodes);
+    dd.a_tmp_2 = device_alloc_zero<double>(num_nodes);
+    dd.u_prv_0 = device_alloc_zero<double>(num_nodes);
+    dd.u_prv_1 = device_alloc_zero<double>(num_nodes);
+    dd.u_prv_2 = device_alloc_zero<double>(num_nodes);
+    dd.delta_u_0 = device_alloc_zero<double>(num_nodes);
+    dd.delta_u_1 = device_alloc_zero<double>(num_nodes);
+    dd.delta_u_2 = device_alloc_zero<double>(num_nodes);
+
     construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-        dd.node_coords, dd.ele_nodes, num_elements,
-        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.coo_row, dd.coo_col);
+        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+        dd.ele_nodes, num_elements,
+        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
     int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val);
+                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
 
     dd.kval_00 = device_alloc_zero<double>(nnz_bcrs);
     dd.kval_01 = device_alloc_zero<double>(nnz_bcrs);
@@ -1471,13 +1570,23 @@ int main(int argc, char *argv[])
     dd.kval_21 = device_alloc_zero<double>(nnz_bcrs);
     dd.kval_22 = device_alloc_zero<double>(nnz_bcrs);
     dd.mval = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_00 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_01 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_02 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_10 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_11 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_12 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_20 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_21 = device_alloc_zero<double>(nnz_bcrs);
+    dd.keval_22 = device_alloc_zero<double>(nnz_bcrs);
     dd.row_ptr = device_alloc_zero<int>(num_nodes + 1);
     dd.col_ind = device_alloc_zero<int>(nnz_bcrs);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, nnz_bcrs, num_nodes,
+    build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
                dd.row_ptr, dd.col_ind, dd.kval_00, dd.kval_01, dd.kval_02,
-               dd.kval_10, dd.kval_11, dd.kval_12, dd.kval_20, dd.kval_21, dd.kval_22, dd.mval);
+               dd.kval_10, dd.kval_11, dd.kval_12, dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+               dd.keval_00, dd.keval_01, dd.keval_02, dd.keval_10, dd.keval_11, dd.keval_12, dd.keval_20, dd.keval_21, dd.keval_22);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     std::cout << "Number of non-zero blocks in bcrs: " << nnz_bcrs << std::endl;
@@ -1504,41 +1613,27 @@ int main(int argc, char *argv[])
 
     // 境界条件の補正値計算と、ブロックヤコビの構築
     extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
-        num_nodes, dd.row_ptr, dd.col_ind, dd.kval_00, dd.kval_01, dd.kval_02,
-        dd.kval_10, dd.kval_11, dd.kval_12, dd.kval_20, dd.kval_21, dd.kval_22, dd.bc_flag,
+        num_nodes, dd.row_ptr, dd.col_ind, dd.keval_00, dd.keval_01, dd.keval_02,
+        dd.keval_10, dd.keval_11, dd.keval_12, dd.keval_20, dd.keval_21, dd.keval_22, dd.bc_flag,
         dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02, dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
         dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     apply_bc_to_lhs<<<grid_nodes, BLOCK_SIZE>>>(
-        num_nodes, dd.row_ptr, dd.col_ind, dd.kval_00, dd.kval_01, dd.kval_02,
-        dd.kval_10, dd.kval_11, dd.kval_12, dd.kval_20, dd.kval_21, dd.kval_22,
+        num_nodes, dd.row_ptr, dd.col_ind, dd.keval_00, dd.keval_01, dd.keval_02,
+        dd.keval_10, dd.keval_11, dd.keval_12, dd.keval_20, dd.keval_21, dd.keval_22,
         dd.bc_flag);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     build_block_jacobi<<<grid_nodes, BLOCK_SIZE>>>(
         num_nodes, dd.row_ptr, dd.col_ind,
-        dd.kval_00, dd.kval_01, dd.kval_02,
-        dd.kval_10, dd.kval_11, dd.kval_12,
-        dd.kval_20, dd.kval_21, dd.kval_22,
+        dd.keval_00, dd.keval_01, dd.keval_02,
+        dd.keval_10, dd.keval_11, dd.keval_12,
+        dd.keval_20, dd.keval_21, dd.keval_22,
         dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
         dd.inv_diag_10, dd.inv_diag_11, dd.inv_diag_12,
         dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22);
     CUDA_CHECK(cudaDeviceSynchronize());
-
-    // 変位・速度・加速度 (ゼロ初期化)
-    dd.u_tmp_0 = device_alloc_zero<double>(num_nodes);
-    dd.u_tmp_1 = device_alloc_zero<double>(num_nodes);
-    dd.u_tmp_2 = device_alloc_zero<double>(num_nodes);
-    dd.v_tmp_0 = device_alloc_zero<double>(num_nodes);
-    dd.v_tmp_1 = device_alloc_zero<double>(num_nodes);
-    dd.v_tmp_2 = device_alloc_zero<double>(num_nodes);
-    dd.a_tmp_0 = device_alloc_zero<double>(num_nodes);
-    dd.a_tmp_1 = device_alloc_zero<double>(num_nodes);
-    dd.a_tmp_2 = device_alloc_zero<double>(num_nodes);
-    dd.u_prv_0 = device_alloc_zero<double>(num_nodes);
-    dd.u_prv_1 = device_alloc_zero<double>(num_nodes);
-    dd.u_prv_2 = device_alloc_zero<double>(num_nodes);
 
     // 右辺・一時ベクトル
     dd.rhs_0 = device_alloc_zero<double>(num_nodes);
@@ -1547,6 +1642,12 @@ int main(int argc, char *argv[])
     dd.tmp_0 = device_alloc_zero<double>(num_nodes);
     dd.tmp_1 = device_alloc_zero<double>(num_nodes);
     dd.tmp_2 = device_alloc_zero<double>(num_nodes);
+    dd.rhs_original_0 = device_alloc_zero<double>(num_nodes);
+    dd.rhs_original_1 = device_alloc_zero<double>(num_nodes);
+    dd.rhs_original_2 = device_alloc_zero<double>(num_nodes);
+    dd.f_int_0 = device_alloc_zero<double>(num_nodes);
+    dd.f_int_1 = device_alloc_zero<double>(num_nodes);
+    dd.f_int_2 = device_alloc_zero<double>(num_nodes);
 
     // PCGベクトル
     dd.r_0 = device_alloc_zero<double>(num_nodes);
@@ -1564,8 +1665,6 @@ int main(int argc, char *argv[])
 
     // 境界条件の値
     dd.bc_val_u = device_alloc_zero<double>(3);
-    dd.bc_val_v = device_alloc_zero<double>(3);
-    dd.bc_val_a = device_alloc_zero<double>(3);
 
     // MPI通信用
     dd.send_nodes = device_alloc_copy(send_nodes_ptr, total_send);
@@ -1577,95 +1676,234 @@ int main(int argc, char *argv[])
     dd.d_reduce = device_alloc_zero<double>(3);
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    double preprocessing_time = MPI_Wtime() - mesh_time;
+    double preprocessing_time = MPI_Wtime() - start_time;
     if (rank == 0)
     {
         std::cout << "Preprocessing time: " << preprocessing_time << " seconds" << std::endl;
     }
 
+    char output_dir[256];
+    sprintf(output_dir, "results/disp");
+    mkdir("results", 0755);
+    mkdir(output_dir, 0755);
+    char vtk_filename[512];
+    sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, 0);
+    write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
+                           u_0, u_1, u_2, 0.0);
+
     // ============================================================
-    // タイムステップループ
+    // タイムステップループ(増分が方程式の解)
     // ============================================================
     for (int step = 1; step <= num_steps; step++)
     {
         CUDA_CHECK(cudaDeviceSynchronize());
         double step_start_time = MPI_Wtime();
 
+        // delta uのリセット
+        CUDA_CHECK(cudaMemset(dd.delta_u_0, 0.0, num_nodes * sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.delta_u_1, 0.0, num_nodes * sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
+
         double t = step * dt;
         bc_val_u[0] = 0.0;
-        bc_val_u[1] = 0.05 * sin(t);
+        bc_val_u[1] = 0.05 * sin(t) - 0.05 * sin(t - dt);
         bc_val_u[2] = 0.0;
-        bc_val_v[0] = 0.0;
-        bc_val_v[1] = 0.05 * cos(t);
-        bc_val_v[2] = 0.0;
-        bc_val_a[0] = 0.0;
-        bc_val_a[1] = -0.05 * sin(t);
-        bc_val_a[2] = 0.0;
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dd.bc_val_v, bc_val_v, 3 * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dd.bc_val_a, bc_val_a, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β RHS構築
         kernel_build_newmark_tmp<<<grid_nodes, BLOCK_SIZE>>>(
             num_nodes, dt_inv2, dt_inv,
-            dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
             dd.v_tmp_0, dd.v_tmp_1, dd.v_tmp_2,
             dd.a_tmp_0, dd.a_tmp_1, dd.a_tmp_2,
             dd.tmp_0, dd.tmp_1, dd.tmp_2);
 
-        // 質量行列SpMV: rhs = M * tmp
+        // 質量行列SpMV: rhs_original = M * tmp
         kernel_bcrs_spmv_m<<<grid_nodes, BLOCK_SIZE>>>(
             num_nodes, dd.row_ptr, dd.col_ind, dd.mval,
             dd.tmp_0, dd.tmp_1, dd.tmp_2,
-            dd.rhs_0, dd.rhs_1, dd.rhs_2);
+            dd.rhs_original_0, dd.rhs_original_1, dd.rhs_original_2);
 
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // 外力の寄与
-        if (force_node >= 0)
+        while (true)
         {
-            double h_rhs_val;
-            double *d_rhs_target;
-            if (force_dof == 0)
-                d_rhs_target = &dd.rhs_0[force_node];
-            else if (force_dof == 1)
-                d_rhs_target = &dd.rhs_1[force_node];
-            else
-                d_rhs_target = &dd.rhs_2[force_node];
+            CUDA_CHECK(cudaDeviceSynchronize());
+            double inner_loop_start_time = MPI_Wtime();
 
-            CUDA_CHECK(cudaMemcpy(&h_rhs_val, d_rhs_target, sizeof(double), cudaMemcpyDeviceToHost));
-            h_rhs_val += force_magnitude;
-            CUDA_CHECK(cudaMemcpy(d_rhs_target, &h_rhs_val, sizeof(double), cudaMemcpyHostToDevice));
+            // rhs = rhs_original - f_int
+            CUDA_CHECK(cudaMemcpy(dd.rhs_0, dd.rhs_original_0, num_nodes * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dd.rhs_1, dd.rhs_original_1, num_nodes * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dd.rhs_2, dd.rhs_original_2, num_nodes * sizeof(double), cudaMemcpyDeviceToDevice));
+            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, -1.0,
+                dd.f_int_0, dd.f_int_1, dd.f_int_2,
+                dd.rhs_0, dd.rhs_1, dd.rhs_2);
+
+            // 外力の寄与
+            if (force_node >= 0)
+            {
+                double h_rhs_val;
+                double *d_rhs_target;
+                if (force_dof == 0)
+                    d_rhs_target = &dd.rhs_0[force_node];
+                else if (force_dof == 1)
+                    d_rhs_target = &dd.rhs_1[force_node];
+                else
+                    d_rhs_target = &dd.rhs_2[force_node];
+
+                CUDA_CHECK(cudaMemcpy(&h_rhs_val, d_rhs_target, sizeof(double), cudaMemcpyDeviceToHost));
+                h_rhs_val += force_magnitude;
+                CUDA_CHECK(cudaMemcpy(d_rhs_target, &h_rhs_val, sizeof(double), cudaMemcpyHostToDevice));
+            }
+
+            // 境界条件を右辺に適用
+            kernel_apply_bc_to_rhs<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, dd.bc_val_u, dd.bc_flag,
+                dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02,
+                dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
+                dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22,
+                dd.rhs_0, dd.rhs_1, dd.rhs_2);
+
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            // PCGソルバー
+            int iter = pcg_solve(dd, requests, num_neighbors, neighbor_ranks,
+                                 recv_starts, recv_counts, send_starts, send_counts,
+                                 num_inner, num_owned, num_nodes, 1e-12, num_nodes * 3);
+
+            MPI_Allreduce(MPI_IN_PLACE, &iter, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+            if (rank == 0)
+            {
+                std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
+            }
+
+            // delta_uに解が入っているので、これを増分として加算
+            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, 1.0,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
+
+            double delta_u_norm;
+            CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
+            kernel_dot3_reduce<<<grid_nodes, BLOCK_SIZE>>>(
+                0, num_nodes, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, &dd.d_reduce[0]);
+            CUDA_CHECK(cudaMemcpy(&delta_u_norm, &dd.d_reduce[0], sizeof(double), cudaMemcpyDeviceToHost));
+            std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
+
+            // 剛性行列、質量行列の再構築、右辺ベクトルの更新
+            {
+                // 2回目以降のループでは、境界条件の増分はゼロにする
+                bc_val_u[0] = 0.0;
+                bc_val_u[1] = 0.0;
+                bc_val_u[2] = 0.0;
+                CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
+
+                construct_mat<<<grid_elements, BLOCK_SIZE>>>(
+                    dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+                    dd.ele_nodes, num_elements,
+                    lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+
+                int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
+                                                   dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+
+                build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
+                           dd.row_ptr, dd.col_ind,
+                           dd.kval_00, dd.kval_01, dd.kval_02,
+                           dd.kval_10, dd.kval_11, dd.kval_12,
+                           dd.kval_20, dd.kval_21, dd.kval_22,
+                           dd.mval,
+                           dd.keval_00, dd.keval_01, dd.keval_02,
+                           dd.keval_10, dd.keval_11, dd.keval_12,
+                           dd.keval_20, dd.keval_21, dd.keval_22);
+
+                extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, dd.row_ptr, dd.col_ind,
+                    dd.keval_00, dd.keval_01, dd.keval_02,
+                    dd.keval_10, dd.keval_11, dd.keval_12,
+                    dd.keval_20, dd.keval_21, dd.keval_22,
+                    dd.bc_flag,
+                    dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02,
+                    dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
+                    dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22);
+
+                apply_bc_to_lhs<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, dd.row_ptr, dd.col_ind,
+                    dd.keval_00, dd.keval_01, dd.keval_02,
+                    dd.keval_10, dd.keval_11, dd.keval_12,
+                    dd.keval_20, dd.keval_21, dd.keval_22,
+                    dd.bc_flag);
+
+                build_block_jacobi<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, dd.row_ptr, dd.col_ind,
+                    dd.keval_00, dd.keval_01, dd.keval_02,
+                    dd.keval_10, dd.keval_11, dd.keval_12,
+                    dd.keval_20, dd.keval_21, dd.keval_22,
+                    dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
+                    dd.inv_diag_10, dd.inv_diag_11, dd.inv_diag_12,
+                    dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22);
+
+                // 右辺ベクトルの更新: f_int += Kmat * delta_u
+                int grid_spmv = (num_nodes * 32 + BLOCK_SIZE - 1) / BLOCK_SIZE; // スレッドあたり32要素処理
+                kernel_spmv<<<grid_spmv, BLOCK_SIZE>>>(
+                    0, num_nodes,
+                    dd.row_ptr, dd.col_ind,
+                    dd.kval_00, dd.kval_01, dd.kval_02,
+                    dd.kval_10, dd.kval_11, dd.kval_12,
+                    dd.kval_20, dd.kval_21, dd.kval_22,
+                    dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                    dd.tmp_0, dd.tmp_1, dd.tmp_2);
+                kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, 1.0,
+                    dd.tmp_0, dd.tmp_1, dd.tmp_2,
+                    dd.f_int_0, dd.f_int_1, dd.f_int_2);
+                // rhs_original -= 4/dt^2 * M * delta_u
+                kernel_bcrs_spmv_m<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, dd.row_ptr, dd.col_ind, dd.mval,
+                    dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                    dd.tmp_0, dd.tmp_1, dd.tmp_2);
+                kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                    num_nodes, -4.0 * dt_inv2,
+                    dd.tmp_0, dd.tmp_1, dd.tmp_2,
+                    dd.rhs_original_0, dd.rhs_original_1, dd.rhs_original_2);
+
+                // 変位で座標を更新
+                update_coords<<<grid_nodes, BLOCK_SIZE>>>(
+                    dd.ref_node_coords,
+                    dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
+                    dd.node_coords, num_nodes);
+
+                // delta uのリセット
+                CUDA_CHECK(cudaMemset(dd.delta_u_0, 0.0, num_nodes * sizeof(double)));
+                CUDA_CHECK(cudaMemset(dd.delta_u_1, 0.0, num_nodes * sizeof(double)));
+                CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
+            }
+
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            double inner_loop_time = MPI_Wtime() - inner_loop_start_time;
+            if (rank == 0)
+            {
+                std::cout << "Step " << step << " inner loop completed in " << inner_loop_time << " seconds." << std::endl;
+            }
+
+            // delta uがゼロに近いなら収束とみなしてループを抜ける
+            if (std::sqrt(delta_u_norm) < 1e-8)
+            {
+                std::cout << "Converged" << std::endl;
+                break;
+            }
         }
 
-        // 境界条件を右辺に適用
-        kernel_apply_bc_to_rhs_free<<<grid_nodes, BLOCK_SIZE>>>(
-            num_nodes, dd.bc_val_u,
-            dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02,
-            dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
-            dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22,
-            dd.rhs_0, dd.rhs_1, dd.rhs_2);
-
-        kernel_apply_bc_to_rhs_constrained<<<grid_nodes, BLOCK_SIZE>>>(
-            num_nodes, dd.bc_flag, dd.bc_val_u,
-            dd.rhs_0, dd.rhs_1, dd.rhs_2);
-
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // PCGソルバー
-        int iter = pcg_solve(dd, requests, num_neighbors, neighbor_ranks,
-                             recv_starts, recv_counts, send_starts, send_counts,
-                             num_inner, num_owned, num_nodes, 1e-8, num_nodes * 3);
-
-        if (rank == 0)
-        {
-            std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
-        }
+        // 改めて境界条件の値をセット（更新のため）
+        bc_val_u[0] = 0.0;
+        bc_val_u[1] = 0.05 * sin(t);
+        bc_val_u[2] = 0.0;
+        CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β更新
         kernel_newmark_update<<<grid_nodes, BLOCK_SIZE>>>(
             num_nodes, dt, dt_inv, dt_inv2,
-            dd.bc_flag, dd.bc_val_u, dd.bc_val_v, dd.bc_val_a,
+            dd.bc_flag, dd.bc_val_u,
             dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
             dd.u_prv_0, dd.u_prv_1, dd.u_prv_2,
             dd.v_tmp_0, dd.v_tmp_1, dd.v_tmp_2,
@@ -1677,12 +1915,22 @@ int main(int argc, char *argv[])
             if (target_node >= 0)
             {
                 double h_u[3];
-                CUDA_CHECK(cudaMemcpy(&h_u[0], &dd.u_tmp_0[target_node], sizeof(double), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&h_u[1], &dd.u_tmp_1[target_node], sizeof(double), cudaMemcpyDeviceToHost));
-                CUDA_CHECK(cudaMemcpy(&h_u[2], &dd.u_tmp_2[target_node], sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(&h_u[0], &dd.u_prv_0[target_node], sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(&h_u[1], &dd.u_prv_1[target_node], sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(&h_u[2], &dd.u_prv_2[target_node], sizeof(double), cudaMemcpyDeviceToHost));
                 u[(step / sample_freq) * 3 + 0] = h_u[0];
                 u[(step / sample_freq) * 3 + 1] = h_u[1];
                 u[(step / sample_freq) * 3 + 2] = h_u[2];
+                std::cout << "Step " << step << ", Target node displacement: ("
+                          << h_u[0] << ", " << h_u[1] << ", " << h_u[2] << ")" << std::endl;
+            }
+            {
+                CUDA_CHECK(cudaMemcpy(u_0, dd.u_prv_0, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(u_1, dd.u_prv_1, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(u_2, dd.u_prv_2, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, step);
+                write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
+                                       u_0, u_1, u_2, t);
             }
         }
 
@@ -1729,6 +1977,15 @@ int main(int argc, char *argv[])
     cudaFree(dd.kval_21);
     cudaFree(dd.kval_22);
     cudaFree(dd.mval);
+    cudaFree(dd.keval_00);
+    cudaFree(dd.keval_01);
+    cudaFree(dd.keval_02);
+    cudaFree(dd.keval_10);
+    cudaFree(dd.keval_11);
+    cudaFree(dd.keval_12);
+    cudaFree(dd.keval_20);
+    cudaFree(dd.keval_21);
+    cudaFree(dd.keval_22);
     cudaFree(dd.bc_flag);
     cudaFree(dd.bc_corr_00);
     cudaFree(dd.bc_corr_01);
@@ -1760,12 +2017,21 @@ int main(int argc, char *argv[])
     cudaFree(dd.u_prv_0);
     cudaFree(dd.u_prv_1);
     cudaFree(dd.u_prv_2);
+    cudaFree(dd.delta_u_0);
+    cudaFree(dd.delta_u_1);
+    cudaFree(dd.delta_u_2);
     cudaFree(dd.rhs_0);
     cudaFree(dd.rhs_1);
     cudaFree(dd.rhs_2);
     cudaFree(dd.tmp_0);
     cudaFree(dd.tmp_1);
     cudaFree(dd.tmp_2);
+    cudaFree(dd.rhs_original_0);
+    cudaFree(dd.rhs_original_1);
+    cudaFree(dd.rhs_original_2);
+    cudaFree(dd.f_int_0);
+    cudaFree(dd.f_int_1);
+    cudaFree(dd.f_int_2);
     cudaFree(dd.r_0);
     cudaFree(dd.r_1);
     cudaFree(dd.r_2);
@@ -1779,8 +2045,6 @@ int main(int argc, char *argv[])
     cudaFree(dd.Ap_1);
     cudaFree(dd.Ap_2);
     cudaFree(dd.bc_val_u);
-    cudaFree(dd.bc_val_v);
-    cudaFree(dd.bc_val_a);
     cudaFree(dd.send_nodes);
     cudaFree(dd.send_buffer_0);
     cudaFree(dd.send_buffer_1);
@@ -1790,6 +2054,9 @@ int main(int argc, char *argv[])
     // CPU メモリ解放
     delete[] bc_flag;
     delete[] u;
+    delete[] u_0;
+    delete[] u_1;
+    delete[] u_2;
     delete[] neighbor_ranks;
     delete[] recv_starts;
     delete[] recv_counts;
