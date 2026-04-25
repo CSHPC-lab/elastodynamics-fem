@@ -14,4 +14,8 @@ force_node      1
 force_dof       2
 force_magnitude 0.0
 
+# Stiffness matrix
 ratio           1.0
+
+# Mass matrix
+lumped          true

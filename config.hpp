@@ -35,6 +35,7 @@ struct Config
     double get_double(const std::string &key) const { return std::stod(data.at(key)); }
     int get_int(const std::string &key) const { return std::stoi(data.at(key)); }
     std::string get_string(const std::string &key) const { return data.at(key); }
+    bool get_bool(const std::string &key) const { return data.at(key) == "true"; }
 
     bool has(const std::string &key) const { return data.count(key) > 0; }
 };

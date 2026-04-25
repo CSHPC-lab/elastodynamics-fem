@@ -274,6 +274,154 @@ __global__ void construct_mat(
     }
 }
 
+// HRZ法による集中質量行列バージョン。
+// mmat_coo_valは対角成分(i==j)のみ非ゼロ、kemat_coo_valの質量寄与も対角ブロックのみ。
+// 署名はconstruct_matと同一なので呼び出し側の変更は最小限。
+//
+// HRZスケール係数の導出:
+//   reference tet体積 = 1/6
+//   sum(diag(c_mmat)) = (4*6 + 6*32)/2520 = 216/2520
+//   alpha = (1/6) / (216/2520) = 35/18
+__global__ void construct_mat_lumped(
+    const double *__restrict__ node_coords,
+    const double *__restrict__ ref_node_coords,
+    const double *__restrict__ delta_u_0,
+    const double *__restrict__ delta_u_1,
+    const double *__restrict__ delta_u_2,
+    const double ratio,
+    const int *__restrict__ ele_nodes,
+    const int num_elements,
+    const double lambda,
+    const double mu,
+    const double rho,
+    const double dt,
+    double *__restrict__ kmat_coo_val,
+    double *__restrict__ mmat_coo_val,
+    double *__restrict__ kemat_coo_val,
+    int *__restrict__ coo_row,
+    int *__restrict__ coo_col)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= num_elements)
+        return;
+
+    int nidx[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+        nidx[i] = ele_nodes[elem * 10 + i];
+
+    double invJ[9], detJ, detJ_m;
+    {
+        double J[9], x0[3];
+        x0[0] = node_coords[nidx[0] * 3 + 0] + ratio * delta_u_0[nidx[0]];
+        x0[1] = node_coords[nidx[0] * 3 + 1] + ratio * delta_u_1[nidx[0]];
+        x0[2] = node_coords[nidx[0] * 3 + 2] + ratio * delta_u_2[nidx[0]];
+        for (int i = 0; i < 3; i++)
+        {
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] + ratio * delta_u_0[nidx[i + 1]] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] + ratio * delta_u_1[nidx[i + 1]] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] + ratio * delta_u_2[nidx[i + 1]] - x0[2];
+        }
+        detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
+               J[1] * (J[5] * J[6] - J[3] * J[8]) +
+               J[2] * (J[3] * J[7] - J[4] * J[6]);
+        invJ[0] = (J[4] * J[8] - J[5] * J[7]) / detJ;
+        invJ[1] = (J[2] * J[7] - J[1] * J[8]) / detJ;
+        invJ[2] = (J[1] * J[5] - J[2] * J[4]) / detJ;
+        invJ[3] = (J[5] * J[6] - J[3] * J[8]) / detJ;
+        invJ[4] = (J[0] * J[8] - J[2] * J[6]) / detJ;
+        invJ[5] = (J[2] * J[3] - J[0] * J[5]) / detJ;
+        invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
+        invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
+        invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+
+        for (int d = 0; d < 3; d++)
+            x0[d] = ref_node_coords[nidx[0] * 3 + d];
+        for (int i = 0; i < 3; i++)
+            for (int d = 0; d < 3; d++)
+                J[3 * i + d] = ref_node_coords[nidx[i + 1] * 3 + d] - x0[d];
+        detJ_m = J[0] * (J[4] * J[8] - J[5] * J[7]) +
+                 J[1] * (J[5] * J[6] - J[3] * J[8]) +
+                 J[2] * (J[3] * J[7] - J[4] * J[6]);
+    }
+    const double detJ_24 = detJ / 24.0;
+    // HRZスケール係数 alpha = (1/6) / (216/2520) = 35/18
+    const double mass_coeff = 4.0 * rho / (dt * dt) * detJ_m * (35.0 / 18.0);
+
+    double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
+    for (int d = 0; d < 3; d++)
+    {
+        const double c0 = invJ[3 * d], c1 = invJ[3 * d + 1], c2 = invJ[3 * d + 2];
+#pragma unroll
+        for (int n = 0; n < 10; n++)
+        {
+            ldN0[d * 10 + n] = c0 * c_dN0[n] + c1 * c_dN0[10 + n] + c2 * c_dN0[20 + n];
+            ldN1[d * 10 + n] = c0 * c_dN1[n] + c1 * c_dN1[10 + n] + c2 * c_dN1[20 + n];
+            ldN2[d * 10 + n] = c0 * c_dN2[n] + c1 * c_dN2[10 + n] + c2 * c_dN2[20 + n];
+            ldN3[d * 10 + n] = c0 * c_dN3[n] + c1 * c_dN3[10 + n] + c2 * c_dN3[20 + n];
+        }
+    }
+
+    const int base = elem * 100;
+
+    for (int i = 0; i < 10; i++)
+    {
+        for (int j = 0; j < 10; j++)
+        {
+            const int ij = i * 10 + j;
+            double kab[9] = {0.0};
+
+#pragma unroll
+            for (int gp = 0; gp < 4; gp++)
+            {
+                const double *ldn = (gp == 0) ? ldN0 : (gp == 1) ? ldN1
+                                                   : (gp == 2)   ? ldN2
+                                                                 : ldN3;
+                const double gi[3] = {ldn[i], ldn[10 + i], ldn[20 + i]};
+                const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
+                const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
+
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                {
+#pragma unroll
+                    for (int b = 0; b < 3; b++)
+                    {
+                        double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
+                        if (a == b)
+                            val += mu * dot;
+                        kab[3 * a + b] += val;
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int k = 0; k < 9; k++)
+            {
+                kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+                kemat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+            }
+
+            coo_row[base + ij] = nidx[i];
+            coo_col[base + ij] = nidx[j];
+
+            if (i == j)
+            {
+                // HRZ集中質量: 対角ノードのみ、スケール係数(35/18)*c_mmat[i,i]を使用
+                const double mii = c_mmat[ij]; // c_mmat[i*10+i]
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                    kemat_coo_val[9 * (base + ij) + 3 * a + a] += mass_coeff * mii;
+                mmat_coo_val[base + ij] = rho * (35.0 / 18.0) * mii * detJ_m;
+            }
+            else
+            {
+                mmat_coo_val[base + ij] = 0.0;
+            }
+        }
+    }
+}
+
 // ---- kmat(9要素) + mmat(1要素) をまとめた構造体 ----
 struct BlockVal
 {
@@ -1435,8 +1583,11 @@ int main(int argc, char *argv[])
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
     double ratio = cfg.get_double("ratio");
+    bool lumped = cfg.has("lumped") && cfg.get_bool("lumped");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
+    if (rank == 0)
+        printf("mass matrix: %s\n", lumped ? "HRZ lumped" : "consistent");
 
     double lambda = rho * (c1 * c1 - 2 * c2 * c2);
     double mu = rho * c2 * c2;
@@ -1552,10 +1703,16 @@ int main(int argc, char *argv[])
     dd.delta_u_1 = device_alloc_zero<double>(num_nodes);
     dd.delta_u_2 = device_alloc_zero<double>(num_nodes);
 
-    construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-        dd.ele_nodes, num_elements,
-        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+    if (lumped)
+        construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
+            dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+            dd.ele_nodes, num_elements,
+            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+    else
+        construct_mat<<<grid_elements, BLOCK_SIZE>>>(
+            dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+            dd.ele_nodes, num_elements,
+            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
     int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
                                        dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
@@ -1798,10 +1955,16 @@ int main(int argc, char *argv[])
                 bc_val_u[2] = 0.0;
                 CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
-                construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-                    dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-                    dd.ele_nodes, num_elements,
-                    lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+                if (lumped)
+                    construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
+                        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+                        dd.ele_nodes, num_elements,
+                        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+                else
+                    construct_mat<<<grid_elements, BLOCK_SIZE>>>(
+                        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
+                        dd.ele_nodes, num_elements,
+                        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
                 int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
                                                    dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
