@@ -17,5 +17,5 @@ force_magnitude 0.0
 # Stiffness matrix
 ratio           1.0
 
-# Mass matrix
-lumped          true
+# Mass matrix: consistent / lumped / second
+mass            second
