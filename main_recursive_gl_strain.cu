@@ -1,7 +1,7 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_recursive.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
+nvcc main_recursive_gl_strain.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
 sm_80はA100向け。H100、GH200ならsm_90。
 mpirun -np 4 ./a.out
 増分解析バージョン
@@ -86,6 +86,9 @@ struct DeviceData
     double *u_prv_0, *u_prv_1, *u_prv_2;
     double *delta_u_0, *delta_u_1, *delta_u_2;
 
+    double *stress_xx, *stress_yy, *stress_zz;
+    double *stress_xy, *stress_yz, *stress_zx;
+
     // 右辺・一時ベクトル
     double *rhs_0, *rhs_1, *rhs_2;
     double *tmp_0, *tmp_1, *tmp_2;
@@ -143,10 +146,12 @@ __constant__ double c_N3[10];
 __global__ void construct_mat(
     const double *__restrict__ node_coords,
     const double *__restrict__ ref_node_coords,
-    const double *__restrict__ delta_u_0,
-    const double *__restrict__ delta_u_1,
-    const double *__restrict__ delta_u_2,
-    const double ratio,
+    const double *__restrict__ stress_xx,
+    const double *__restrict__ stress_yy,
+    const double *__restrict__ stress_zz,
+    const double *__restrict__ stress_xy,
+    const double *__restrict__ stress_yz,
+    const double *__restrict__ stress_zx,
     const int *__restrict__ ele_nodes,
     const int num_elements,
     const double lambda,
@@ -173,14 +178,14 @@ __global__ void construct_mat(
     double invJ[9], detJ, detJ_m;
     {
         double J[9], x0[3];
-        x0[0] = node_coords[nidx[0] * 3 + 0] + ratio * delta_u_0[nidx[0]];
-        x0[1] = node_coords[nidx[0] * 3 + 1] + ratio * delta_u_1[nidx[0]];
-        x0[2] = node_coords[nidx[0] * 3 + 2] + ratio * delta_u_2[nidx[0]];
+        x0[0] = node_coords[nidx[0] * 3 + 0];
+        x0[1] = node_coords[nidx[0] * 3 + 1];
+        x0[2] = node_coords[nidx[0] * 3 + 2];
         for (int i = 0; i < 3; i++)
         {
-            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] + ratio * delta_u_0[nidx[i + 1]] - x0[0];
-            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] + ratio * delta_u_1[nidx[i + 1]] - x0[1];
-            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] + ratio * delta_u_2[nidx[i + 1]] - x0[2];
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] - x0[2];
         }
         detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
                J[1] * (J[5] * J[6] - J[3] * J[8]) +
@@ -232,7 +237,7 @@ __global__ void construct_mat(
             const int ij = i * 10 + j;
             double kab[9] = {0.0};
 
-// 4ガウス点の寄与を加算 (手動展開)
+// 4ガウス点の寄与を加算
 #pragma unroll
             for (int gp = 0; gp < 4; gp++)
             {
@@ -243,10 +248,9 @@ __global__ void construct_mat(
                 const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
                 const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
 
-#pragma unroll
+                //  材料剛性
                 for (int a = 0; a < 3; a++)
                 {
-#pragma unroll
                     for (int b = 0; b < 3; b++)
                     {
                         double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
@@ -255,6 +259,21 @@ __global__ void construct_mat(
                         kab[3 * a + b] += val;
                     }
                 }
+
+                // 幾何剛性
+                const double Sxx = stress_xx[elem * 4 + gp];
+                const double Syy = stress_yy[elem * 4 + gp];
+                const double Szz = stress_zz[elem * 4 + gp];
+                const double Sxy = stress_xy[elem * 4 + gp];
+                const double Syz = stress_yz[elem * 4 + gp];
+                const double Szx = stress_zx[elem * 4 + gp];
+                const double Sgi0 = Sxx * gi[0] + Sxy * gi[1] + Szx * gi[2];
+                const double Sgi1 = Sxy * gi[0] + Syy * gi[1] + Syz * gi[2];
+                const double Sgi2 = Szx * gi[0] + Syz * gi[1] + Szz * gi[2];
+                const double geo = Sgi0 * gj[0] + Sgi1 * gj[1] + Sgi2 * gj[2];
+                kab[0] += geo; // (a=b=0)
+                kab[4] += geo; // (a=b=1)
+                kab[8] += geo; // (a=b=2)
             }
 
 // 書き出し
@@ -289,10 +308,12 @@ __global__ void construct_mat(
 __global__ void construct_mat_lumped(
     const double *__restrict__ node_coords,
     const double *__restrict__ ref_node_coords,
-    const double *__restrict__ delta_u_0,
-    const double *__restrict__ delta_u_1,
-    const double *__restrict__ delta_u_2,
-    const double ratio,
+    const double *__restrict__ stress_xx,
+    const double *__restrict__ stress_yy,
+    const double *__restrict__ stress_zz,
+    const double *__restrict__ stress_xy,
+    const double *__restrict__ stress_yz,
+    const double *__restrict__ stress_zx,
     const int *__restrict__ ele_nodes,
     const int num_elements,
     const double lambda,
@@ -317,14 +338,14 @@ __global__ void construct_mat_lumped(
     double invJ[9], detJ, detJ_m;
     {
         double J[9], x0[3];
-        x0[0] = node_coords[nidx[0] * 3 + 0] + ratio * delta_u_0[nidx[0]];
-        x0[1] = node_coords[nidx[0] * 3 + 1] + ratio * delta_u_1[nidx[0]];
-        x0[2] = node_coords[nidx[0] * 3 + 2] + ratio * delta_u_2[nidx[0]];
+        x0[0] = node_coords[nidx[0] * 3 + 0];
+        x0[1] = node_coords[nidx[0] * 3 + 1];
+        x0[2] = node_coords[nidx[0] * 3 + 2];
         for (int i = 0; i < 3; i++)
         {
-            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] + ratio * delta_u_0[nidx[i + 1]] - x0[0];
-            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] + ratio * delta_u_1[nidx[i + 1]] - x0[1];
-            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] + ratio * delta_u_2[nidx[i + 1]] - x0[2];
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] - x0[2];
         }
         detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
                J[1] * (J[5] * J[6] - J[3] * J[8]) +
@@ -375,6 +396,7 @@ __global__ void construct_mat_lumped(
             const int ij = i * 10 + j;
             double kab[9] = {0.0};
 
+// 4ガウス点の寄与を加算
 #pragma unroll
             for (int gp = 0; gp < 4; gp++)
             {
@@ -385,10 +407,9 @@ __global__ void construct_mat_lumped(
                 const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
                 const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
 
-#pragma unroll
+                //  材料剛性
                 for (int a = 0; a < 3; a++)
                 {
-#pragma unroll
                     for (int b = 0; b < 3; b++)
                     {
                         double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
@@ -397,6 +418,21 @@ __global__ void construct_mat_lumped(
                         kab[3 * a + b] += val;
                     }
                 }
+
+                // 幾何剛性
+                const double Sxx = stress_xx[elem * 4 + gp];
+                const double Syy = stress_yy[elem * 4 + gp];
+                const double Szz = stress_zz[elem * 4 + gp];
+                const double Sxy = stress_xy[elem * 4 + gp];
+                const double Syz = stress_yz[elem * 4 + gp];
+                const double Szx = stress_zx[elem * 4 + gp];
+                const double Sgi0 = Sxx * gi[0] + Sxy * gi[1] + Szx * gi[2];
+                const double Sgi1 = Sxy * gi[0] + Syy * gi[1] + Syz * gi[2];
+                const double Sgi2 = Szx * gi[0] + Syz * gi[1] + Szz * gi[2];
+                const double geo = Sgi0 * gj[0] + Sgi1 * gj[1] + Sgi2 * gj[2];
+                kab[0] += geo; // (a=b=0)
+                kab[4] += geo; // (a=b=1)
+                kab[8] += geo; // (a=b=2)
             }
 
 #pragma unroll
@@ -431,10 +467,12 @@ __global__ void construct_mat_lumped(
 __global__ void construct_mat_second(
     const double *__restrict__ node_coords,
     const double *__restrict__ ref_node_coords,
-    const double *__restrict__ delta_u_0,
-    const double *__restrict__ delta_u_1,
-    const double *__restrict__ delta_u_2,
-    const double ratio,
+    const double *__restrict__ stress_xx,
+    const double *__restrict__ stress_yy,
+    const double *__restrict__ stress_zz,
+    const double *__restrict__ stress_xy,
+    const double *__restrict__ stress_yz,
+    const double *__restrict__ stress_zx,
     const int *__restrict__ ele_nodes,
     const int num_elements,
     const double lambda,
@@ -459,14 +497,14 @@ __global__ void construct_mat_second(
     double invJ[9], detJ, detJ_m;
     {
         double J[9], x0[3];
-        x0[0] = node_coords[nidx[0] * 3 + 0] + ratio * delta_u_0[nidx[0]];
-        x0[1] = node_coords[nidx[0] * 3 + 1] + ratio * delta_u_1[nidx[0]];
-        x0[2] = node_coords[nidx[0] * 3 + 2] + ratio * delta_u_2[nidx[0]];
+        x0[0] = node_coords[nidx[0] * 3 + 0];
+        x0[1] = node_coords[nidx[0] * 3 + 1];
+        x0[2] = node_coords[nidx[0] * 3 + 2];
         for (int i = 0; i < 3; i++)
         {
-            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] + ratio * delta_u_0[nidx[i + 1]] - x0[0];
-            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] + ratio * delta_u_1[nidx[i + 1]] - x0[1];
-            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] + ratio * delta_u_2[nidx[i + 1]] - x0[2];
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] - x0[2];
         }
         detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
                J[1] * (J[5] * J[6] - J[3] * J[8]) +
@@ -532,6 +570,7 @@ __global__ void construct_mat_second(
             const int ij = i * 10 + j;
             double kab[9] = {0.0};
 
+// 4ガウス点の寄与を加算
 #pragma unroll
             for (int gp = 0; gp < 4; gp++)
             {
@@ -542,10 +581,9 @@ __global__ void construct_mat_second(
                 const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
                 const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
 
-#pragma unroll
+                //  材料剛性
                 for (int a = 0; a < 3; a++)
                 {
-#pragma unroll
                     for (int b = 0; b < 3; b++)
                     {
                         double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
@@ -554,6 +592,21 @@ __global__ void construct_mat_second(
                         kab[3 * a + b] += val;
                     }
                 }
+
+                // 幾何剛性
+                const double Sxx = stress_xx[elem * 4 + gp];
+                const double Syy = stress_yy[elem * 4 + gp];
+                const double Szz = stress_zz[elem * 4 + gp];
+                const double Sxy = stress_xy[elem * 4 + gp];
+                const double Syz = stress_yz[elem * 4 + gp];
+                const double Szx = stress_zx[elem * 4 + gp];
+                const double Sgi0 = Sxx * gi[0] + Sxy * gi[1] + Szx * gi[2];
+                const double Sgi1 = Sxy * gi[0] + Syy * gi[1] + Syz * gi[2];
+                const double Sgi2 = Szx * gi[0] + Syz * gi[1] + Szz * gi[2];
+                const double geo = Sgi0 * gj[0] + Sgi1 * gj[1] + Sgi2 * gj[2];
+                kab[0] += geo; // (a=b=0)
+                kab[4] += geo; // (a=b=1)
+                kab[8] += geo; // (a=b=2)
             }
 
 #pragma unroll
@@ -1220,6 +1273,162 @@ __global__ void kernel_spmv(
     }
 }
 
+__global__ void update_stress_kernel(
+    const double *__restrict__ node_coords,
+    const double *__restrict__ delta_u_0,
+    const double *__restrict__ delta_u_1,
+    const double *__restrict__ delta_u_2,
+    const int *__restrict__ ele_nodes,
+    const int num_elements,
+    const double lambda, const double mu,
+    double *__restrict__ stress_xx, double *__restrict__ stress_yy, double *__restrict__ stress_zz,
+    double *__restrict__ stress_xy, double *__restrict__ stress_yz, double *__restrict__ stress_zx)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= num_elements)
+        return;
+
+    int nidx[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+        nidx[i] = ele_nodes[elem * 10 + i];
+
+    // x^(i) でのヤコビアン
+    double invJ[9], detJ;
+    {
+        double J[9], x0[3];
+        x0[0] = node_coords[nidx[0] * 3 + 0];
+        x0[1] = node_coords[nidx[0] * 3 + 1];
+        x0[2] = node_coords[nidx[0] * 3 + 2];
+        for (int i = 0; i < 3; i++)
+        {
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] - x0[2];
+        }
+        detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) + J[1] * (J[5] * J[6] - J[3] * J[8]) + J[2] * (J[3] * J[7] - J[4] * J[6]);
+        invJ[0] = (J[4] * J[8] - J[5] * J[7]) / detJ;
+        invJ[1] = (J[2] * J[7] - J[1] * J[8]) / detJ;
+        invJ[2] = (J[1] * J[5] - J[2] * J[4]) / detJ;
+        invJ[3] = (J[5] * J[6] - J[3] * J[8]) / detJ;
+        invJ[4] = (J[0] * J[8] - J[2] * J[6]) / detJ;
+        invJ[5] = (J[2] * J[3] - J[0] * J[5]) / detJ;
+        invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
+        invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
+        invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+    }
+
+    // 物理座標での形状関数勾配
+    double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
+    for (int d = 0; d < 3; d++)
+    {
+        const double c0 = invJ[3 * d], c1 = invJ[3 * d + 1], c2 = invJ[3 * d + 2];
+#pragma unroll
+        for (int n = 0; n < 10; n++)
+        {
+            ldN0[d * 10 + n] = c0 * c_dN0[n] + c1 * c_dN0[10 + n] + c2 * c_dN0[20 + n];
+            ldN1[d * 10 + n] = c0 * c_dN1[n] + c1 * c_dN1[10 + n] + c2 * c_dN1[20 + n];
+            ldN2[d * 10 + n] = c0 * c_dN2[n] + c1 * c_dN2[10 + n] + c2 * c_dN2[20 + n];
+            ldN3[d * 10 + n] = c0 * c_dN3[n] + c1 * c_dN3[10 + n] + c2 * c_dN3[20 + n];
+        }
+    }
+
+// 各Gauss点で応力を更新
+#pragma unroll
+    for (int gp = 0; gp < 4; gp++)
+    {
+        const double *ldn = (gp == 0) ? ldN0 : (gp == 1) ? ldN1
+                                           : (gp == 2)   ? ldN2
+                                                         : ldN3;
+
+        // H_mn = sum_a Δu_m^a * N_a,n
+        double H[9] = {0};
+        for (int a = 0; a < 10; a++)
+        {
+            const double du0 = delta_u_0[nidx[a]];
+            const double du1 = delta_u_1[nidx[a]];
+            const double du2 = delta_u_2[nidx[a]];
+            const double gn0 = ldn[a], gn1 = ldn[10 + a], gn2 = ldn[20 + a];
+            H[0] += du0 * gn0;
+            H[1] += du0 * gn1;
+            H[2] += du0 * gn2;
+            H[3] += du1 * gn0;
+            H[4] += du1 * gn1;
+            H[5] += du1 * gn2;
+            H[6] += du2 * gn0;
+            H[7] += du2 * gn1;
+            H[8] += du2 * gn2;
+        }
+
+        // ΔE = (H + H^T + H^T H) / 2  (Voigt形式)
+        const double HtH00 = H[0] * H[0] + H[3] * H[3] + H[6] * H[6];
+        const double HtH11 = H[1] * H[1] + H[4] * H[4] + H[7] * H[7];
+        const double HtH22 = H[2] * H[2] + H[5] * H[5] + H[8] * H[8];
+        const double HtH01 = H[0] * H[1] + H[3] * H[4] + H[6] * H[7];
+        const double HtH12 = H[1] * H[2] + H[4] * H[5] + H[7] * H[8];
+        const double HtH02 = H[0] * H[2] + H[3] * H[5] + H[6] * H[8];
+
+        const double dExx = H[0] + 0.5 * HtH00;
+        const double dEyy = H[4] + 0.5 * HtH11;
+        const double dEzz = H[8] + 0.5 * HtH22;
+        const double dExy = 0.5 * (H[1] + H[3]) + 0.5 * HtH01;
+        const double dEyz = 0.5 * (H[5] + H[7]) + 0.5 * HtH12;
+        const double dEzx = 0.5 * (H[2] + H[6]) + 0.5 * HtH02;
+
+        // Δs = D Δe (等方線形)
+        const double tr = dExx + dEyy + dEzz;
+        const double dSxx = lambda * tr + 2.0 * mu * dExx;
+        const double dSyy = lambda * tr + 2.0 * mu * dEyy;
+        const double dSzz = lambda * tr + 2.0 * mu * dEzz;
+        const double dSxy = 2.0 * mu * dExy;
+        const double dSyz = 2.0 * mu * dEyz;
+        const double dSzx = 2.0 * mu * dEzx;
+
+        // S_trial = S^(i) + ΔS
+        const int idx = elem * 4 + gp;
+        const double Sxx = stress_xx[idx] + dSxx;
+        const double Syy = stress_yy[idx] + dSyy;
+        const double Szz = stress_zz[idx] + dSzz;
+        const double Sxy = stress_xy[idx] + dSxy;
+        const double Syz = stress_yz[idx] + dSyz;
+        const double Szx = stress_zx[idx] + dSzx;
+
+        // F = I + H, J = det(F)
+        const double F[9] = {1.0 + H[0], H[1], H[2],
+                             H[3], 1.0 + H[4], H[5],
+                             H[6], H[7], 1.0 + H[8]};
+        const double Jdet = F[0] * (F[4] * F[8] - F[5] * F[7]) - F[1] * (F[3] * F[8] - F[5] * F[6]) + F[2] * (F[3] * F[7] - F[4] * F[6]);
+
+        // Push-forward: S_new = (1/J) F S_trial F^T
+        const double S[9] = {Sxx, Sxy, Szx, Sxy, Syy, Syz, Szx, Syz, Szz};
+        double FS[9];
+        for (int m = 0; m < 3; m++)
+            for (int n = 0; n < 3; n++)
+            {
+                double s = 0;
+                for (int k = 0; k < 3; k++)
+                    s += F[3 * m + k] * S[3 * k + n];
+                FS[3 * m + n] = s;
+            }
+        double FSF[9];
+        for (int m = 0; m < 3; m++)
+            for (int n = 0; n < 3; n++)
+            {
+                double s = 0;
+                for (int k = 0; k < 3; k++)
+                    s += FS[3 * m + k] * F[3 * n + k];
+                FSF[3 * m + n] = s;
+            }
+        const double invJ_scal = 1.0 / Jdet;
+        stress_xx[idx] = FSF[0] * invJ_scal;
+        stress_yy[idx] = FSF[4] * invJ_scal;
+        stress_zz[idx] = FSF[8] * invJ_scal;
+        stress_xy[idx] = FSF[1] * invJ_scal;
+        stress_yz[idx] = FSF[5] * invJ_scal;
+        stress_zx[idx] = FSF[2] * invJ_scal;
+    }
+}
+
 __global__ void update_coords(
     const double *__restrict__ ref_node_coords,
     const double *__restrict__ u_tmp_0,
@@ -1235,6 +1444,96 @@ __global__ void update_coords(
     node_coords[i * 3 + 0] = ref_node_coords[i * 3 + 0] + u_tmp_0[i];
     node_coords[i * 3 + 1] = ref_node_coords[i * 3 + 1] + u_tmp_1[i];
     node_coords[i * 3 + 2] = ref_node_coords[i * 3 + 2] + u_tmp_2[i];
+}
+
+__global__ void compute_internal_force_kernel(
+    const double *__restrict__ node_coords,
+    const int *__restrict__ ele_nodes,
+    const int num_elements,
+    const double *__restrict__ stress_xx, const double *__restrict__ stress_yy, const double *__restrict__ stress_zz,
+    const double *__restrict__ stress_xy, const double *__restrict__ stress_yz, const double *__restrict__ stress_zx,
+    double *__restrict__ f_int_0,
+    double *__restrict__ f_int_1,
+    double *__restrict__ f_int_2)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= num_elements)
+        return;
+
+    int nidx[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+        nidx[i] = ele_nodes[elem * 10 + i];
+
+    // x^(i+1) でのヤコビアン
+    double invJ[9], detJ;
+    {
+        double J[9], x0[3];
+        x0[0] = node_coords[nidx[0] * 3 + 0];
+        x0[1] = node_coords[nidx[0] * 3 + 1];
+        x0[2] = node_coords[nidx[0] * 3 + 2];
+        for (int i = 0; i < 3; i++)
+        {
+            J[3 * i + 0] = node_coords[nidx[i + 1] * 3 + 0] - x0[0];
+            J[3 * i + 1] = node_coords[nidx[i + 1] * 3 + 1] - x0[1];
+            J[3 * i + 2] = node_coords[nidx[i + 1] * 3 + 2] - x0[2];
+        }
+        detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) + J[1] * (J[5] * J[6] - J[3] * J[8]) + J[2] * (J[3] * J[7] - J[4] * J[6]);
+        invJ[0] = (J[4] * J[8] - J[5] * J[7]) / detJ;
+        invJ[1] = (J[2] * J[7] - J[1] * J[8]) / detJ;
+        invJ[2] = (J[1] * J[5] - J[2] * J[4]) / detJ;
+        invJ[3] = (J[5] * J[6] - J[3] * J[8]) / detJ;
+        invJ[4] = (J[0] * J[8] - J[2] * J[6]) / detJ;
+        invJ[5] = (J[2] * J[3] - J[0] * J[5]) / detJ;
+        invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
+        invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
+        invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+    }
+    const double detJ_24 = detJ / 24.0;
+
+    // 物理座標での形状関数勾配
+    double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
+    for (int d = 0; d < 3; d++)
+    {
+        const double c0 = invJ[3 * d], c1 = invJ[3 * d + 1], c2 = invJ[3 * d + 2];
+#pragma unroll
+        for (int n = 0; n < 10; n++)
+        {
+            ldN0[d * 10 + n] = c0 * c_dN0[n] + c1 * c_dN0[10 + n] + c2 * c_dN0[20 + n];
+            ldN1[d * 10 + n] = c0 * c_dN1[n] + c1 * c_dN1[10 + n] + c2 * c_dN1[20 + n];
+            ldN2[d * 10 + n] = c0 * c_dN2[n] + c1 * c_dN2[10 + n] + c2 * c_dN2[20 + n];
+            ldN3[d * 10 + n] = c0 * c_dN3[n] + c1 * c_dN3[10 + n] + c2 * c_dN3[20 + n];
+        }
+    }
+
+    // 要素節点ごとの内力寄与
+    double fe0[10] = {0}, fe1[10] = {0}, fe2[10] = {0};
+
+#pragma unroll
+    for (int gp = 0; gp < 4; gp++)
+    {
+        const double *ldn = (gp == 0) ? ldN0 : (gp == 1) ? ldN1
+                                           : (gp == 2)   ? ldN2
+                                                         : ldN3;
+        const int idx = elem * 4 + gp;
+        const double Sxx = stress_xx[idx], Syy = stress_yy[idx], Szz = stress_zz[idx];
+        const double Sxy = stress_xy[idx], Syz = stress_yz[idx], Szx = stress_zx[idx];
+
+        for (int i = 0; i < 10; i++)
+        {
+            const double gi0 = ldn[i], gi1 = ldn[10 + i], gi2 = ldn[20 + i];
+            fe0[i] += (gi0 * Sxx + gi1 * Sxy + gi2 * Szx) * detJ_24;
+            fe1[i] += (gi0 * Sxy + gi1 * Syy + gi2 * Syz) * detJ_24;
+            fe2[i] += (gi0 * Szx + gi1 * Syz + gi2 * Szz) * detJ_24;
+        }
+    }
+
+    for (int i = 0; i < 10; i++)
+    {
+        atomicAdd(&f_int_0[nidx[i]], fe0[i]);
+        atomicAdd(&f_int_1[nidx[i]], fe1[i]);
+        atomicAdd(&f_int_2[nidx[i]], fe2[i]);
+    }
 }
 
 // --- Newmark-β 更新カーネル ---
@@ -1770,7 +2069,6 @@ int main(int argc, char *argv[])
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
     double disp_amp = cfg.get_double("disp_amp");
-    double ratio = cfg.get_double("ratio");
     enum class MassVersion
     {
         CONSISTENT,
@@ -1900,7 +2198,7 @@ int main(int argc, char *argv[])
     // 基準となる座標をコピーして記録
     dd.ref_node_coords = device_alloc_copy(node_coords, num_nodes * 3);
 
-    // 変位・速度・加速度 (ゼロ初期化)
+    // 変位・速度・加速度・応力 (ゼロ初期化)
     dd.u_tmp_0 = device_alloc_zero<double>(num_nodes);
     dd.u_tmp_1 = device_alloc_zero<double>(num_nodes);
     dd.u_tmp_2 = device_alloc_zero<double>(num_nodes);
@@ -1916,22 +2214,25 @@ int main(int argc, char *argv[])
     dd.delta_u_0 = device_alloc_zero<double>(num_nodes);
     dd.delta_u_1 = device_alloc_zero<double>(num_nodes);
     dd.delta_u_2 = device_alloc_zero<double>(num_nodes);
+    dd.stress_xx = device_alloc_zero<double>(num_elements * 4);
+    dd.stress_yy = device_alloc_zero<double>(num_elements * 4);
+    dd.stress_zz = device_alloc_zero<double>(num_elements * 4);
+    dd.stress_xy = device_alloc_zero<double>(num_elements * 4);
+    dd.stress_yz = device_alloc_zero<double>(num_elements * 4);
+    dd.stress_zx = device_alloc_zero<double>(num_elements * 4);
 
     if (mass_version == MassVersion::SECOND)
         construct_mat_second<<<grid_elements, BLOCK_SIZE>>>(
-            dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-            dd.ele_nodes, num_elements,
-            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+            dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
     else if (mass_version == MassVersion::LUMPED)
         construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
-            dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-            dd.ele_nodes, num_elements,
-            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+            dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
     else
         construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-            dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-            dd.ele_nodes, num_elements,
-            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+            dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
     int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
                                        dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
@@ -2169,104 +2470,103 @@ int main(int argc, char *argv[])
             CUDA_CHECK(cudaMemcpy(&delta_u_norm, &dd.d_reduce[0], sizeof(double), cudaMemcpyDeviceToHost));
             std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
 
+            // 応力更新(座標更新の前)
+            update_stress_kernel<<<grid_elements, BLOCK_SIZE>>>(
+                dd.node_coords,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.ele_nodes, num_elements, lambda, mu,
+                dd.stress_xx, dd.stress_yy, dd.stress_zz,
+                dd.stress_xy, dd.stress_yz, dd.stress_zx);
+
+            // rhs_original -= 4/dt^2 * M * delta_u
+            kernel_bcrs_spmv_m<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, dd.row_ptr, dd.col_ind, dd.mval,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.tmp_0, dd.tmp_1, dd.tmp_2);
+            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, -4.0 * dt_inv2,
+                dd.tmp_0, dd.tmp_1, dd.tmp_2,
+                dd.rhs_original_0, dd.rhs_original_1, dd.rhs_original_2);
+
+            // 変位で座標を更新
+            update_coords<<<grid_nodes, BLOCK_SIZE>>>(
+                dd.ref_node_coords,
+                dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
+                dd.node_coords, num_nodes);
+
+            // delta uのリセット
+            CUDA_CHECK(cudaMemset(dd.delta_u_0, 0.0, num_nodes * sizeof(double)));
+            CUDA_CHECK(cudaMemset(dd.delta_u_1, 0.0, num_nodes * sizeof(double)));
+            CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
+
+            // 2回目以降のループでは、境界条件の増分はゼロにする
+            bc_val_u[0] = 0.0;
+            bc_val_u[1] = 0.0;
+            bc_val_u[2] = 0.0;
+            CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
+
             // 剛性行列、質量行列の再構築、右辺ベクトルの更新
-            {
-                // 2回目以降のループでは、境界条件の増分はゼロにする
-                bc_val_u[0] = 0.0;
-                bc_val_u[1] = 0.0;
-                bc_val_u[2] = 0.0;
-                CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
+            if (mass_version == MassVersion::SECOND)
+                construct_mat_second<<<grid_elements, BLOCK_SIZE>>>(
+                    dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+                    dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            else if (mass_version == MassVersion::LUMPED)
+                construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
+                    dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+                    dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            else
+                construct_mat<<<grid_elements, BLOCK_SIZE>>>(
+                    dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
+                    dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
-                if (mass_version == MassVersion::SECOND)
-                    construct_mat_second<<<grid_elements, BLOCK_SIZE>>>(
-                        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-                        dd.ele_nodes, num_elements,
-                        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
-                else if (mass_version == MassVersion::LUMPED)
-                    construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
-                        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-                        dd.ele_nodes, num_elements,
-                        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
-                else
-                    construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-                        dd.node_coords, dd.ref_node_coords, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, ratio,
-                        dd.ele_nodes, num_elements,
-                        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
+            int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
+                                               dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
 
-                int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                                   dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+            build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
+                       dd.row_ptr, dd.col_ind,
+                       dd.kval_00, dd.kval_01, dd.kval_02,
+                       dd.kval_10, dd.kval_11, dd.kval_12,
+                       dd.kval_20, dd.kval_21, dd.kval_22,
+                       dd.mval,
+                       dd.keval_00, dd.keval_01, dd.keval_02,
+                       dd.keval_10, dd.keval_11, dd.keval_12,
+                       dd.keval_20, dd.keval_21, dd.keval_22);
 
-                build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
-                           dd.row_ptr, dd.col_ind,
-                           dd.kval_00, dd.kval_01, dd.kval_02,
-                           dd.kval_10, dd.kval_11, dd.kval_12,
-                           dd.kval_20, dd.kval_21, dd.kval_22,
-                           dd.mval,
-                           dd.keval_00, dd.keval_01, dd.keval_02,
-                           dd.keval_10, dd.keval_11, dd.keval_12,
-                           dd.keval_20, dd.keval_21, dd.keval_22);
+            extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, dd.row_ptr, dd.col_ind,
+                dd.keval_00, dd.keval_01, dd.keval_02,
+                dd.keval_10, dd.keval_11, dd.keval_12,
+                dd.keval_20, dd.keval_21, dd.keval_22,
+                dd.bc_flag,
+                dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02,
+                dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
+                dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22);
 
-                extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, dd.row_ptr, dd.col_ind,
-                    dd.keval_00, dd.keval_01, dd.keval_02,
-                    dd.keval_10, dd.keval_11, dd.keval_12,
-                    dd.keval_20, dd.keval_21, dd.keval_22,
-                    dd.bc_flag,
-                    dd.bc_corr_00, dd.bc_corr_01, dd.bc_corr_02,
-                    dd.bc_corr_10, dd.bc_corr_11, dd.bc_corr_12,
-                    dd.bc_corr_20, dd.bc_corr_21, dd.bc_corr_22);
+            apply_bc_to_lhs<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, dd.row_ptr, dd.col_ind,
+                dd.keval_00, dd.keval_01, dd.keval_02,
+                dd.keval_10, dd.keval_11, dd.keval_12,
+                dd.keval_20, dd.keval_21, dd.keval_22,
+                dd.bc_flag);
 
-                apply_bc_to_lhs<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, dd.row_ptr, dd.col_ind,
-                    dd.keval_00, dd.keval_01, dd.keval_02,
-                    dd.keval_10, dd.keval_11, dd.keval_12,
-                    dd.keval_20, dd.keval_21, dd.keval_22,
-                    dd.bc_flag);
+            build_block_jacobi<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, dd.row_ptr, dd.col_ind,
+                dd.keval_00, dd.keval_01, dd.keval_02,
+                dd.keval_10, dd.keval_11, dd.keval_12,
+                dd.keval_20, dd.keval_21, dd.keval_22,
+                dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
+                dd.inv_diag_10, dd.inv_diag_11, dd.inv_diag_12,
+                dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22);
 
-                build_block_jacobi<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, dd.row_ptr, dd.col_ind,
-                    dd.keval_00, dd.keval_01, dd.keval_02,
-                    dd.keval_10, dd.keval_11, dd.keval_12,
-                    dd.keval_20, dd.keval_21, dd.keval_22,
-                    dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
-                    dd.inv_diag_10, dd.inv_diag_11, dd.inv_diag_12,
-                    dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22);
-
-                // 右辺ベクトルの更新: f_int += Kmat * delta_u
-                int grid_spmv = (num_nodes * 32 + BLOCK_SIZE - 1) / BLOCK_SIZE; // スレッドあたり32要素処理
-                kernel_spmv<<<grid_spmv, BLOCK_SIZE>>>(
-                    0, num_nodes,
-                    dd.row_ptr, dd.col_ind,
-                    dd.kval_00, dd.kval_01, dd.kval_02,
-                    dd.kval_10, dd.kval_11, dd.kval_12,
-                    dd.kval_20, dd.kval_21, dd.kval_22,
-                    dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
-                    dd.tmp_0, dd.tmp_1, dd.tmp_2);
-                kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, 1.0,
-                    dd.tmp_0, dd.tmp_1, dd.tmp_2,
-                    dd.f_int_0, dd.f_int_1, dd.f_int_2);
-                // rhs_original -= 4/dt^2 * M * delta_u
-                kernel_bcrs_spmv_m<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, dd.row_ptr, dd.col_ind, dd.mval,
-                    dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
-                    dd.tmp_0, dd.tmp_1, dd.tmp_2);
-                kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
-                    num_nodes, -4.0 * dt_inv2,
-                    dd.tmp_0, dd.tmp_1, dd.tmp_2,
-                    dd.rhs_original_0, dd.rhs_original_1, dd.rhs_original_2);
-
-                // 変位で座標を更新
-                update_coords<<<grid_nodes, BLOCK_SIZE>>>(
-                    dd.ref_node_coords,
-                    dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2,
-                    dd.node_coords, num_nodes);
-
-                // delta uのリセット
-                CUDA_CHECK(cudaMemset(dd.delta_u_0, 0.0, num_nodes * sizeof(double)));
-                CUDA_CHECK(cudaMemset(dd.delta_u_1, 0.0, num_nodes * sizeof(double)));
-                CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
-            }
+            // f_int を再計算
+            cudaMemset(dd.f_int_0, 0, num_nodes * sizeof(double));
+            cudaMemset(dd.f_int_1, 0, num_nodes * sizeof(double));
+            cudaMemset(dd.f_int_2, 0, num_nodes * sizeof(double));
+            compute_internal_force_kernel<<<grid_elements, BLOCK_SIZE>>>(
+                dd.node_coords, dd.ele_nodes, num_elements,
+                dd.stress_xx, dd.stress_yy, dd.stress_zz,
+                dd.stress_xy, dd.stress_yz, dd.stress_zx,
+                dd.f_int_0, dd.f_int_1, dd.f_int_2);
 
             CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -2411,6 +2711,12 @@ int main(int argc, char *argv[])
     cudaFree(dd.delta_u_0);
     cudaFree(dd.delta_u_1);
     cudaFree(dd.delta_u_2);
+    cudaFree(dd.stress_xx);
+    cudaFree(dd.stress_yy);
+    cudaFree(dd.stress_zz);
+    cudaFree(dd.stress_xy);
+    cudaFree(dd.stress_yz);
+    cudaFree(dd.stress_zx);
     cudaFree(dd.rhs_0);
     cudaFree(dd.rhs_1);
     cudaFree(dd.rhs_2);

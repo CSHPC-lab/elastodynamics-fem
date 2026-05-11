@@ -13,6 +13,6 @@
 !CONTROL, NAME=fstrCNT
  column_fistr.cnt
 !RESULT, NAME=fstrRES, IO=OUT
- column_fistr.res
+ results/column_fistr.res
 !RESULT, NAME=vis_out, IO=OUT
  column_fistr_vis

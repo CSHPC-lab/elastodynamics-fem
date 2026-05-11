@@ -2,7 +2,8 @@
 FrontISTR .msh + .res → VTK 変換スクリプト（完全汎用・各成分の最大/最小トラッキング版）
 
 使い方:
-  python3 msh_res2vtk.py work/column_fistr.msh work/column_fistr.res.0.*
+rm linear/results/column_fistr.res.0.*.vtk
+python3 msh_res2vtk.py linear/column_fistr.msh linear/results/column_fistr.res.0.*
 """
 
 import sys

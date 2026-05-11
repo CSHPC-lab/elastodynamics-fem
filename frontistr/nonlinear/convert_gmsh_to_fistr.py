@@ -29,7 +29,6 @@ import sys
 import os
 from math import sin
 
-
 # ---------------------------------------------------------------------------
 # Material / amplitude parameters
 # ---------------------------------------------------------------------------
@@ -37,8 +36,8 @@ YOUNG = 160000000.0 / 3.0
 POISSON = 1.0 / 3.0
 DENSITY = 2000.0
 AMP_DT = 0.000625  # amplitude table time step [s]
-AMP_END = 20.0  # amplitude table end time [s]
-WAVE_AMP = 1.0
+AMP_END = 40.0  # amplitude table end time [s]
+WAVE_AMP = 0.001
 
 
 # ---------------------------------------------------------------------------
