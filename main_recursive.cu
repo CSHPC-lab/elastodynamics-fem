@@ -1227,6 +1227,53 @@ __global__ void kernel_pack_send_buffer(
     sb2[offset + i] = p2[node];
 }
 
+static void exchange_nodal_vector(
+    int num_neighbors,
+    const int *neighbor_ranks,
+    const int *recv_starts,
+    const int *recv_counts,
+    const int *send_starts,
+    const int *send_counts,
+    const int *send_nodes,
+    double *v0, double *v1, double *v2,
+    double *send_buffer_0,
+    double *send_buffer_1,
+    double *send_buffer_2,
+    MPI_Request *requests,
+    int tag_base)
+{
+    if (num_neighbors <= 0)
+        return;
+
+    for (int n = 0; n < num_neighbors; n++)
+    {
+        int ss = send_starts[n], sc = send_counts[n];
+        if (sc > 0)
+        {
+            int gs = (sc + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            kernel_pack_send_buffer<<<gs, BLOCK_SIZE>>>(
+                sc, ss, send_nodes,
+                v0, v1, v2,
+                send_buffer_0, send_buffer_1, send_buffer_2);
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    for (int n = 0; n < num_neighbors; n++)
+    {
+        int ss = send_starts[n], sc = send_counts[n];
+        int rs = recv_starts[n], rc = recv_counts[n];
+        MPI_Isend(&send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], tag_base, MPI_COMM_WORLD, &requests[n]);
+        MPI_Isend(&send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], tag_base + 1, MPI_COMM_WORLD, &requests[num_neighbors + n]);
+        MPI_Isend(&send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], tag_base + 2, MPI_COMM_WORLD, &requests[2 * num_neighbors + n]);
+        MPI_Irecv(&v0[rs], rc, MPI_DOUBLE, neighbor_ranks[n], tag_base, MPI_COMM_WORLD, &requests[3 * num_neighbors + n]);
+        MPI_Irecv(&v1[rs], rc, MPI_DOUBLE, neighbor_ranks[n], tag_base + 1, MPI_COMM_WORLD, &requests[4 * num_neighbors + n]);
+        MPI_Irecv(&v2[rs], rc, MPI_DOUBLE, neighbor_ranks[n], tag_base + 2, MPI_COMM_WORLD, &requests[5 * num_neighbors + n]);
+    }
+    MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 // --- SpMV (1つのWarpが1行を担当するので、行数×32個のthreadが必要) ---
 __global__ void kernel_spmv(
     int start, int end,
@@ -2245,12 +2292,6 @@ int main(int argc, char *argv[])
                 std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
             }
 
-            // delta_uに解が入っているので、これを増分として加算
-            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
-                num_nodes, 1.0,
-                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
-                dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
-
             double delta_u_norm;
             CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
             int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -2262,6 +2303,20 @@ int main(int argc, char *argv[])
             MPI_Allreduce(MPI_IN_PLACE, &delta_u_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
             if (rank == 0)
                 std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
+
+            // K 再構築と座標更新が正しい隣接節点値を読むように同期する。
+            exchange_nodal_vector(num_neighbors, neighbor_ranks,
+                                  recv_starts, recv_counts, send_starts, send_counts,
+                                  dd.send_nodes,
+                                  dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                                  dd.send_buffer_0, dd.send_buffer_1, dd.send_buffer_2,
+                                  requests, 20);
+
+            // 同期済み delta_u を使えば ghost の u_tmp もローカルに更新できる。
+            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, 1.0,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
 
             // 剛性行列、質量行列の再構築、右辺ベクトルの更新
             {
