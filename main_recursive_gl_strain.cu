@@ -108,8 +108,6 @@ struct DeviceData
     // MPI 通信用（GPU側: pack/accumulate カーネル用）
     int *send_nodes;
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
-    // f_int 逆方向通信用（ゴースト節点の f_int を送信するバッファ: total_recv サイズ）
-    double *ghost_fint_buffer_0, *ghost_fint_buffer_1, *ghost_fint_buffer_2;
 
     // リダクション用
     double *d_reduce; // 小さいバッファ（3要素程度）
@@ -1333,36 +1331,6 @@ static void exchange_nodal_vector(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// --- f_int 逆方向通信: ゴースト節点の値を送信バッファにパック ---
-__global__ void kernel_pack_ghost_fint(
-    int recv_start, int recv_count, int buf_offset,
-    const double *f0, const double *f1, const double *f2,
-    double *buf0, double *buf1, double *buf2)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= recv_count)
-        return;
-    buf0[buf_offset + i] = f0[recv_start + i];
-    buf1[buf_offset + i] = f1[recv_start + i];
-    buf2[buf_offset + i] = f2[recv_start + i];
-}
-
-// --- f_int 逆方向通信: 受信バッファを所有節点の f_int に加算 ---
-__global__ void kernel_accumulate_fint_recv(
-    int send_count, int send_offset,
-    const int *send_nodes,
-    const double *buf0, const double *buf1, const double *buf2,
-    double *f0, double *f1, double *f2)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= send_count)
-        return;
-    int node = send_nodes[send_offset + i];
-    atomicAdd(&f0[node], buf0[send_offset + i]);
-    atomicAdd(&f1[node], buf1[send_offset + i]);
-    atomicAdd(&f2[node], buf2[send_offset + i]);
-}
-
 // --- SpMV (1つのWarpが1行を担当するので、行数×32個のthreadが必要) ---
 __global__ void kernel_spmv(
     int start, int end,
@@ -2291,8 +2259,8 @@ void print_memory_estimate(int num_nodes, int num_elements,
     const size_t bcrs_bytes_ub = (size_t)nnz_coo * (19 * 8 + 4) + (size_t)(num_nodes + 1) * 4;
 
     // ── MPI通信バッファ（常駐） ──────────────────────────────
-    // send_nodes(int) + send_buffer×3(double) + ghost_fint_buffer×3(double) + d_reduce/bc_val_u
-    const size_t mpi_bytes = (size_t)total_send * (4 + 3 * 8) + (size_t)total_recv * (3 * 8) + 64;
+    // send_nodes(int) + send_buffer×3(double) + d_reduce/bc_val_u
+    const size_t mpi_bytes = (size_t)total_send * (4 + 3 * 8) + 64;
 
     const size_t total_bytes = node_bytes + elem_bytes + coo_bytes + sort_bytes + bcrs_bytes_ub + mpi_bytes;
 
@@ -2404,10 +2372,8 @@ int main(int argc, char *argv[])
     int num_ghost = mesh.num_ghost;
     int *ele_nodes = mesh.elem_ptr();
     int num_elements = mesh.num_total_elems;
-    int num_owned_elements = mesh.num_owned_elems;
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_elements = (num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int grid_owned_elements = (num_owned_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     int num_neighbors = mesh.num_neighbors();
     int *neighbor_ranks = new int[num_neighbors];
@@ -2651,10 +2617,6 @@ int main(int argc, char *argv[])
     dd.send_buffer_0 = device_alloc_zero<double>(std::max(1, total_send));
     dd.send_buffer_1 = device_alloc_zero<double>(std::max(1, total_send));
     dd.send_buffer_2 = device_alloc_zero<double>(std::max(1, total_send));
-    // f_int 逆方向通信用（ゴースト節点の値を送信）
-    dd.ghost_fint_buffer_0 = device_alloc_zero<double>(std::max(1, total_recv));
-    dd.ghost_fint_buffer_1 = device_alloc_zero<double>(std::max(1, total_recv));
-    dd.ghost_fint_buffer_2 = device_alloc_zero<double>(std::max(1, total_recv));
 
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
@@ -2901,75 +2863,22 @@ int main(int argc, char *argv[])
                 dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22);
 
             // f_int を再計算
+            // 接線行列と同じ owned+ghost 要素セットからローカルに組み立てる。
+            // GL 版では stress が要素履歴変数なので、K と f_int で別 rank の
+            // stress コピーを混ぜると残差と接線が整合しない。
+            double t_fint_local = 0.0;
+            double _t_fint = do_timing ? MPI_Wtime() : 0.0;
             cudaMemset(dd.f_int_0, 0, num_nodes * sizeof(double));
             cudaMemset(dd.f_int_1, 0, num_nodes * sizeof(double));
             cudaMemset(dd.f_int_2, 0, num_nodes * sizeof(double));
-            compute_internal_force_kernel<<<grid_owned_elements, BLOCK_SIZE>>>(
-                dd.node_coords, dd.ele_nodes, num_owned_elements,
+            compute_internal_force_kernel<<<grid_elements, BLOCK_SIZE>>>(
+                dd.node_coords, dd.ele_nodes, num_elements,
                 dd.stress_xx, dd.stress_yy, dd.stress_zz,
                 dd.stress_xy, dd.stress_yz, dd.stress_zx,
                 dd.f_int_0, dd.f_int_1, dd.f_int_2);
             CUDA_CHECK(cudaDeviceSynchronize());
-
-            // f_int の逆方向 MPI 通信（ゴースト→所有ノードへの集約）
-            double t_fint_mpi = 0.0;
-            {
-                // ゴースト節点の f_int を ghost_fint_buffer にパック
-                int ghost_buf_offset = 0;
-                for (int n = 0; n < num_neighbors; n++)
-                {
-                    int rs = recv_starts[n];
-                    int rc = recv_counts[n];
-                    if (rc > 0)
-                    {
-                        int g = (rc + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                        kernel_pack_ghost_fint<<<g, BLOCK_SIZE>>>(
-                            rs, rc, ghost_buf_offset,
-                            dd.f_int_0, dd.f_int_1, dd.f_int_2,
-                            dd.ghost_fint_buffer_0, dd.ghost_fint_buffer_1, dd.ghost_fint_buffer_2);
-                    }
-                    ghost_buf_offset += rc;
-                }
-                CUDA_CHECK(cudaDeviceSynchronize());
-
-                double _t = do_timing ? MPI_Wtime() : 0.0;
-                ghost_buf_offset = 0;
-                // GPU-direct: デバイスポインタを直接送受信
-                for (int n = 0; n < num_neighbors; n++)
-                {
-                    int rc = recv_counts[n];
-                    int ss = send_starts[n];
-                    int sc = send_counts[n];
-                    MPI_Isend(&dd.ghost_fint_buffer_0[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[n]);
-                    MPI_Isend(&dd.ghost_fint_buffer_1[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[num_neighbors + n]);
-                    MPI_Isend(&dd.ghost_fint_buffer_2[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[2 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[3 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[4 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[5 * num_neighbors + n]);
-                    ghost_buf_offset += rc;
-                }
-                MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
-                // GPU-aware MPI がデバイスメモリへ書いた受信バッファを、
-                // 後続の accumulate カーネルが確実に読むために同期する。
-                CUDA_CHECK(cudaDeviceSynchronize());
-                if (do_timing)
-                    t_fint_mpi = MPI_Wtime() - _t;
-
-                for (int n = 0; n < num_neighbors; n++)
-                {
-                    int ss = send_starts[n];
-                    int sc = send_counts[n];
-                    if (sc > 0)
-                    {
-                        int g = (sc + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                        kernel_accumulate_fint_recv<<<g, BLOCK_SIZE>>>(
-                            sc, ss, dd.send_nodes,
-                            dd.send_buffer_0, dd.send_buffer_1, dd.send_buffer_2,
-                            dd.f_int_0, dd.f_int_1, dd.f_int_2);
-                    }
-                }
-                CUDA_CHECK(cudaDeviceSynchronize());
-            }
+            if (do_timing)
+                t_fint_local = MPI_Wtime() - _t_fint;
 
             double inner_loop_time = MPI_Wtime() - inner_loop_start_time;
 
@@ -2989,7 +2898,7 @@ int main(int argc, char *argv[])
                     pcg_t.precond,
                     pcg_t.allreduce_rznew,
                     allreduce_total_local,
-                    t_fint_mpi,
+                    t_fint_local,
                     inner_loop_time};
                 double timing_max[sizeof(timing_local) / sizeof(timing_local[0])] = {};
                 MPI_Reduce(timing_local, timing_max,
@@ -3006,7 +2915,7 @@ int main(int argc, char *argv[])
                            timing_max[2], timing_max[0],
                            timing_max[1] + timing_max[3], timing_max[1], timing_max[3],
                            timing_max[7], timing_max[5]);
-                    printf("  [timing rank-max] PCG外: f_int_MPI=%.3fs 内側ループ合計=%.3fs\n",
+                    printf("  [timing rank-max] PCG外: f_int_local=%.3fs 内側ループ合計=%.3fs\n",
                            timing_max[10], timing_max[11]);
                 }
             }
@@ -3192,9 +3101,6 @@ int main(int argc, char *argv[])
     cudaFree(dd.send_buffer_0);
     cudaFree(dd.send_buffer_1);
     cudaFree(dd.send_buffer_2);
-    cudaFree(dd.ghost_fint_buffer_0);
-    cudaFree(dd.ghost_fint_buffer_1);
-    cudaFree(dd.ghost_fint_buffer_2);
     cudaFree(dd.d_reduce);
 
     // CPU メモリ解放
