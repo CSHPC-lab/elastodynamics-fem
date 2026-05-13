@@ -2910,23 +2910,55 @@ int main(int argc, char *argv[])
             }
 
             double inner_loop_time = MPI_Wtime() - inner_loop_start_time;
+            const double allreduce_total_local =
+                pcg_t.allreduce_pAp + pcg_t.allreduce_rnorm + pcg_t.allreduce_rznew;
+
+            double timing_local[] = {
+                pcg_t.pack_buf,
+                pcg_t.spmv_inner,
+                pcg_t.halo_wait,
+                pcg_t.spmv_bdr,
+                pcg_t.allreduce_pAp,
+                pcg_t.update_x_r,
+                pcg_t.allreduce_rnorm,
+                pcg_t.precond,
+                pcg_t.allreduce_rznew,
+                allreduce_total_local,
+                t_fint_mpi,
+                inner_loop_time};
+            double timing_max[sizeof(timing_local) / sizeof(timing_local[0])] = {};
+            MPI_Reduce(timing_local, timing_max,
+                       static_cast<int>(sizeof(timing_local) / sizeof(timing_local[0])),
+                       MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
             if (rank == 0)
             {
-                // PCG内訳とPCG外操作の時間を一覧表示
-                double pcg_total = pcg_t.pack_buf + pcg_t.spmv_inner + pcg_t.halo_wait + pcg_t.spmv_bdr + pcg_t.allreduce_pAp + pcg_t.update_x_r + pcg_t.allreduce_rnorm + pcg_t.precond + pcg_t.allreduce_rznew;
-                double allreduce_total = pcg_t.allreduce_pAp + pcg_t.allreduce_rnorm + pcg_t.allreduce_rznew;
-                printf("  [timing] PCG内訳(%d反復): "
+                const double pack_buf_max = timing_max[0];
+                const double spmv_inner_max = timing_max[1];
+                const double halo_wait_max = timing_max[2];
+                const double spmv_bdr_max = timing_max[3];
+                const double allreduce_pAp_max = timing_max[4];
+                const double update_x_r_max = timing_max[5];
+                const double allreduce_rnorm_max = timing_max[6];
+                const double precond_max = timing_max[7];
+                const double allreduce_rznew_max = timing_max[8];
+                const double allreduce_total_max = timing_max[9];
+                const double t_fint_mpi_max = timing_max[10];
+                const double inner_loop_time_max = timing_max[11];
+
+                printf("  [timing rank-max] PCG内訳(%d反復): "
                        "AllReduce合計=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) "
-                       "HaloWait=%.3fs SpMV(inner+bdr)=%.3fs 前処理=%.3fs GPU更新=%.3fs\n",
+                       "HaloWait=%.3fs Pack=%.3fs SpMV(inner+bdr)=%.3fs(%.3f+%.3f) "
+                       "前処理=%.3fs GPU更新=%.3fs\n",
                        iter,
-                       allreduce_total, pcg_t.allreduce_pAp, pcg_t.allreduce_rnorm, pcg_t.allreduce_rznew,
-                       pcg_t.halo_wait,
-                       pcg_t.spmv_inner + pcg_t.spmv_bdr,
-                       pcg_t.precond,
-                       pcg_t.update_x_r);
-                printf("  [timing] PCG外: f_int_MPI=%.3fs 内側ループ合計=%.3fs\n",
-                       t_fint_mpi, inner_loop_time);
-                std::cout << "Step " << step << " inner loop completed in " << inner_loop_time << " seconds." << std::endl;
+                       allreduce_total_max, allreduce_pAp_max, allreduce_rnorm_max, allreduce_rznew_max,
+                       halo_wait_max, pack_buf_max,
+                       spmv_inner_max + spmv_bdr_max, spmv_inner_max, spmv_bdr_max,
+                       precond_max,
+                       update_x_r_max);
+                printf("  [timing rank-max] PCG外: f_int_MPI=%.3fs 内側ループ合計=%.3fs\n",
+                       t_fint_mpi_max, inner_loop_time_max);
+                std::cout << "Step " << step << " inner loop completed in " << inner_loop_time_max << " seconds." << std::endl;
             }
 
             // delta uがゼロに近いなら収束とみなしてループを抜ける
