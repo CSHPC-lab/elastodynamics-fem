@@ -1245,7 +1245,7 @@ int pcg_solve(
 
 void write_vtk_displacement(
     const char *filename, double *node_coords, int num_nodes,
-    int *ele_nodes, int num_elements, double *displacement, double total_time)
+    int *ele_nodes, int num_elements, double *displacement_0, double *displacement_1, double *displacement_2, double total_time)
 {
     FILE *fp = fopen(filename, "w");
     fprintf(fp, "# vtk DataFile Version 2.0\n");
@@ -1277,7 +1277,7 @@ void write_vtk_displacement(
         fprintf(fp, "%d\n", i + 1);
     fprintf(fp, "VECTORS DISPLACEMENT double\n");
     for (int i = 0; i < num_nodes; i++)
-        fprintf(fp, "%.15e %.15e %.15e\n", displacement[i * 3 + 0], displacement[i * 3 + 1], displacement[i * 3 + 2]);
+        fprintf(fp, "%.15e %.15e %.15e\n", displacement_0[i], displacement_1[i], displacement_2[i]);
     fclose(fp);
 }
 
@@ -1358,6 +1358,8 @@ int main(int argc, char *argv[])
     int force_node = get_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
+    double disp_amp = cfg.get_double("disp_amp");
+    bool write_vtk = cfg.get_bool("write_vtk");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
 
@@ -1399,13 +1401,12 @@ int main(int argc, char *argv[])
         neighbor_ranks[i] = mesh.neighbors[i].partition_id - 1;
         recv_starts[i] = mesh.neighbors[i].recv_start;
         recv_counts[i] = mesh.neighbors[i].recv_count;
-        send_starts[i] = 0;
         send_counts[i] = mesh.neighbors[i].send_size();
-        if (i > 0)
-            send_starts[i] = send_starts[i - 1] + send_counts[i - 1];
         send_nodes_vec.insert(send_nodes_vec.end(), mesh.neighbors[i].send_nodes.begin(), mesh.neighbors[i].send_nodes.end());
     }
-    send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
+    send_starts[0] = 0;
+    for (int i = 0; i < num_neighbors; i++)
+        send_starts[i + 1] = send_starts[i] + send_counts[i];
     int total_send = send_starts[num_neighbors];
     int *send_nodes_ptr = send_nodes_vec.data();
 
@@ -1420,6 +1421,9 @@ int main(int argc, char *argv[])
     }
 
     double *u = new double[(num_steps / sample_freq + 1) * 3]();
+    double *u_0 = new double[num_nodes]();
+    double *u_1 = new double[num_nodes]();
+    double *u_2 = new double[num_nodes]();
     int *bc_flag = new int[num_nodes]();
     double bc_val_u[3], bc_val_v[3], bc_val_a[3];
 
@@ -1577,10 +1581,22 @@ int main(int argc, char *argv[])
     dd.d_reduce = device_alloc_zero<double>(3);
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    double preprocessing_time = MPI_Wtime() - mesh_time;
+    double preprocessing_time = MPI_Wtime() - start_time;
     if (rank == 0)
     {
         std::cout << "Preprocessing time: " << preprocessing_time << " seconds" << std::endl;
+    }
+
+    char output_dir[256];
+    sprintf(output_dir, "results/disp");
+    mkdir("results", 0755);
+    mkdir(output_dir, 0755);
+    char vtk_filename[512];
+    if (write_vtk)
+    {
+        sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, 0, rank);
+        write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
+                               u_0, u_1, u_2, 0.0);
     }
 
     // ============================================================
@@ -1593,13 +1609,13 @@ int main(int argc, char *argv[])
 
         double t = step * dt;
         bc_val_u[0] = 0.0;
-        bc_val_u[1] = 0.05 * sin(t);
+        bc_val_u[1] = disp_amp * sin(t);
         bc_val_u[2] = 0.0;
         bc_val_v[0] = 0.0;
-        bc_val_v[1] = 0.05 * cos(t);
+        bc_val_v[1] = disp_amp * cos(t);
         bc_val_v[2] = 0.0;
         bc_val_a[0] = 0.0;
-        bc_val_a[1] = -0.05 * sin(t);
+        bc_val_a[1] = -disp_amp * sin(t);
         bc_val_a[2] = 0.0;
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.bc_val_v, bc_val_v, 3 * sizeof(double), cudaMemcpyHostToDevice));
@@ -1683,6 +1699,17 @@ int main(int argc, char *argv[])
                 u[(step / sample_freq) * 3 + 0] = h_u[0];
                 u[(step / sample_freq) * 3 + 1] = h_u[1];
                 u[(step / sample_freq) * 3 + 2] = h_u[2];
+                std::cout << "Step " << step << ", Target node displacement: ("
+                          << h_u[0] << ", " << h_u[1] << ", " << h_u[2] << ")" << std::endl;
+            }
+            if (write_vtk)
+            {
+                CUDA_CHECK(cudaMemcpy(u_0, dd.u_tmp_0, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(u_1, dd.u_tmp_1, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(u_2, dd.u_tmp_2, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+                sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, step, rank);
+                write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
+                                       u_0, u_1, u_2, t);
             }
         }
 
@@ -1790,6 +1817,9 @@ int main(int argc, char *argv[])
     // CPU メモリ解放
     delete[] bc_flag;
     delete[] u;
+    delete[] u_0;
+    delete[] u_1;
+    delete[] u_2;
     delete[] neighbor_ranks;
     delete[] recv_starts;
     delete[] recv_counts;

@@ -1834,13 +1834,12 @@ int main(int argc, char *argv[])
         neighbor_ranks[i] = mesh.neighbors[i].partition_id - 1;
         recv_starts[i] = mesh.neighbors[i].recv_start;
         recv_counts[i] = mesh.neighbors[i].recv_count;
-        send_starts[i] = 0;
         send_counts[i] = mesh.neighbors[i].send_size();
-        if (i > 0)
-            send_starts[i] = send_starts[i - 1] + send_counts[i - 1];
         send_nodes_vec.insert(send_nodes_vec.end(), mesh.neighbors[i].send_nodes.begin(), mesh.neighbors[i].send_nodes.end());
     }
-    send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
+    send_starts[0] = 0;
+    for (int i = 0; i < num_neighbors; i++)
+        send_starts[i + 1] = send_starts[i] + send_counts[i];
     int total_send = send_starts[num_neighbors];
     int *send_nodes_ptr = send_nodes_vec.data();
 
@@ -2065,7 +2064,7 @@ int main(int argc, char *argv[])
     char vtk_filename[512];
     if (write_vtk)
     {
-        sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, 0);
+        sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, 0, rank);
         write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
                                u_0, u_1, u_2, 0.0);
     }
@@ -2148,8 +2147,6 @@ int main(int argc, char *argv[])
                                  recv_starts, recv_counts, send_starts, send_counts,
                                  num_inner, num_owned, num_nodes, 1e-12, num_nodes * 3);
 
-            MPI_Allreduce(MPI_IN_PLACE, &iter, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-
             if (rank == 0)
             {
                 std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
@@ -2163,11 +2160,15 @@ int main(int argc, char *argv[])
 
             double delta_u_norm;
             CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
-            kernel_dot3_reduce<<<grid_nodes, BLOCK_SIZE>>>(
-                0, num_nodes, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+            int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            kernel_dot3_reduce<<<grid_owned, BLOCK_SIZE>>>(
+                0, num_owned, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
                 dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, &dd.d_reduce[0]);
+            CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(&delta_u_norm, &dd.d_reduce[0], sizeof(double), cudaMemcpyDeviceToHost));
-            std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
+            MPI_Allreduce(MPI_IN_PLACE, &delta_u_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            if (rank == 0)
+                std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
 
             // 剛性行列、質量行列の再構築、右辺ベクトルの更新
             {
@@ -2279,7 +2280,8 @@ int main(int argc, char *argv[])
             // delta uがゼロに近いなら収束とみなしてループを抜ける
             if (std::sqrt(delta_u_norm) < 1e-8)
             {
-                std::cout << "Converged" << std::endl;
+                if (rank == 0)
+                    std::cout << "Converged" << std::endl;
                 break;
             }
         }
@@ -2319,7 +2321,7 @@ int main(int argc, char *argv[])
                 CUDA_CHECK(cudaMemcpy(u_0, dd.u_prv_0, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(u_1, dd.u_prv_1, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(u_2, dd.u_prv_2, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
-                sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, step);
+                sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, step, rank);
                 write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
                                        u_0, u_1, u_2, t);
             }

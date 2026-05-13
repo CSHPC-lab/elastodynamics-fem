@@ -107,6 +107,8 @@ struct DeviceData
     // MPI 通信用
     int *send_nodes;
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
+    // f_int 逆方向通信用（ゴースト節点の f_int を送信するバッファ: total_recv サイズ）
+    double *ghost_fint_buffer_0, *ghost_fint_buffer_1, *ghost_fint_buffer_2;
 
     // リダクション用
     double *d_reduce; // 小さいバッファ（3要素程度）
@@ -1222,6 +1224,36 @@ __global__ void kernel_pack_send_buffer(
     sb2[offset + i] = p2[node];
 }
 
+// --- f_int 逆方向通信: ゴースト節点の値を送信バッファにパック ---
+__global__ void kernel_pack_ghost_fint(
+    int recv_start, int recv_count, int buf_offset,
+    const double *f0, const double *f1, const double *f2,
+    double *buf0, double *buf1, double *buf2)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= recv_count)
+        return;
+    buf0[buf_offset + i] = f0[recv_start + i];
+    buf1[buf_offset + i] = f1[recv_start + i];
+    buf2[buf_offset + i] = f2[recv_start + i];
+}
+
+// --- f_int 逆方向通信: 受信バッファを所有節点の f_int に加算 ---
+__global__ void kernel_accumulate_fint_recv(
+    int send_count, int send_offset,
+    const int *send_nodes,
+    const double *buf0, const double *buf1, const double *buf2,
+    double *f0, double *f1, double *f2)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= send_count)
+        return;
+    int node = send_nodes[send_offset + i];
+    atomicAdd(&f0[node], buf0[send_offset + i]);
+    atomicAdd(&f1[node], buf1[send_offset + i]);
+    atomicAdd(&f2[node], buf2[send_offset + i]);
+}
+
 // --- SpMV (1つのWarpが1行を担当するので、行数×32個のthreadが必要) ---
 __global__ void kernel_spmv(
     int start, int end,
@@ -2132,14 +2164,16 @@ int main(int argc, char *argv[])
         neighbor_ranks[i] = mesh.neighbors[i].partition_id - 1;
         recv_starts[i] = mesh.neighbors[i].recv_start;
         recv_counts[i] = mesh.neighbors[i].recv_count;
-        send_starts[i] = 0;
         send_counts[i] = mesh.neighbors[i].send_size();
-        if (i > 0)
-            send_starts[i] = send_starts[i - 1] + send_counts[i - 1];
         send_nodes_vec.insert(send_nodes_vec.end(), mesh.neighbors[i].send_nodes.begin(), mesh.neighbors[i].send_nodes.end());
     }
-    send_starts[num_neighbors] = send_starts[num_neighbors - 1] + send_counts[num_neighbors - 1];
+    send_starts[0] = 0;
+    for (int i = 0; i < num_neighbors; i++)
+        send_starts[i + 1] = send_starts[i] + send_counts[i];
     int total_send = send_starts[num_neighbors];
+    int total_recv = 0;
+    for (int i = 0; i < num_neighbors; i++)
+        total_recv += recv_counts[i];
     int *send_nodes_ptr = send_nodes_vec.data();
 
     if (target_node >= 0)
@@ -2344,10 +2378,14 @@ int main(int argc, char *argv[])
     dd.bc_val_u = device_alloc_zero<double>(3);
 
     // MPI通信用
-    dd.send_nodes = device_alloc_copy(send_nodes_ptr, total_send);
-    dd.send_buffer_0 = device_alloc_zero<double>(total_send);
-    dd.send_buffer_1 = device_alloc_zero<double>(total_send);
-    dd.send_buffer_2 = device_alloc_zero<double>(total_send);
+    dd.send_nodes = (total_send > 0) ? device_alloc_copy(send_nodes_ptr, total_send) : device_alloc_zero<int>(1);
+    dd.send_buffer_0 = device_alloc_zero<double>(std::max(1, total_send));
+    dd.send_buffer_1 = device_alloc_zero<double>(std::max(1, total_send));
+    dd.send_buffer_2 = device_alloc_zero<double>(std::max(1, total_send));
+    // f_int 逆方向通信用（ゴースト節点の値を送信）
+    dd.ghost_fint_buffer_0 = device_alloc_zero<double>(std::max(1, total_recv));
+    dd.ghost_fint_buffer_1 = device_alloc_zero<double>(std::max(1, total_recv));
+    dd.ghost_fint_buffer_2 = device_alloc_zero<double>(std::max(1, total_recv));
 
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
@@ -2366,7 +2404,7 @@ int main(int argc, char *argv[])
     char vtk_filename[512];
     if (write_vtk)
     {
-        sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, 0);
+        sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, 0, rank);
         write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
                                u_0, u_1, u_2, 0.0);
     }
@@ -2449,8 +2487,6 @@ int main(int argc, char *argv[])
                                  recv_starts, recv_counts, send_starts, send_counts,
                                  num_inner, num_owned, num_nodes, 1e-12, num_nodes * 3);
 
-            MPI_Allreduce(MPI_IN_PLACE, &iter, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-
             if (rank == 0)
             {
                 std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
@@ -2464,11 +2500,15 @@ int main(int argc, char *argv[])
 
             double delta_u_norm;
             CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
-            kernel_dot3_reduce<<<grid_nodes, BLOCK_SIZE>>>(
-                0, num_nodes, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+            int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            kernel_dot3_reduce<<<grid_owned, BLOCK_SIZE>>>(
+                0, num_owned, dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
                 dd.delta_u_0, dd.delta_u_1, dd.delta_u_2, &dd.d_reduce[0]);
+            CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(&delta_u_norm, &dd.d_reduce[0], sizeof(double), cudaMemcpyDeviceToHost));
-            std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
+            MPI_Allreduce(MPI_IN_PLACE, &delta_u_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            if (rank == 0)
+                std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
 
             // 応力更新(座標更新の前)
             update_stress_kernel<<<grid_elements, BLOCK_SIZE>>>(
@@ -2567,8 +2607,62 @@ int main(int argc, char *argv[])
                 dd.stress_xx, dd.stress_yy, dd.stress_zz,
                 dd.stress_xy, dd.stress_yz, dd.stress_zx,
                 dd.f_int_0, dd.f_int_1, dd.f_int_2);
-
             CUDA_CHECK(cudaDeviceSynchronize());
+
+            // f_int の逆方向 MPI 通信（ゴースト→所有ノードへの集約）
+            // ゴースト節点に加算された寄与分を隣接プロセスの所有ノードに送る
+            {
+                // ゴースト節点の f_int を ghost_fint_buffer にパック
+                int ghost_buf_offset = 0;
+                for (int n = 0; n < num_neighbors; n++)
+                {
+                    int rs = recv_starts[n];
+                    int rc = recv_counts[n];
+                    if (rc > 0)
+                    {
+                        int g = (rc + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                        kernel_pack_ghost_fint<<<g, BLOCK_SIZE>>>(
+                            rs, rc, ghost_buf_offset,
+                            dd.f_int_0, dd.f_int_1, dd.f_int_2,
+                            dd.ghost_fint_buffer_0, dd.ghost_fint_buffer_1, dd.ghost_fint_buffer_2);
+                    }
+                    ghost_buf_offset += rc;
+                }
+                CUDA_CHECK(cudaDeviceSynchronize());
+
+                // 送受信: ゴーストデータを相手プロセスへ、相手のゴーストデータを受信
+                ghost_buf_offset = 0;
+                for (int n = 0; n < num_neighbors; n++)
+                {
+                    int rc = recv_counts[n];
+                    int ss = send_starts[n];
+                    int sc = send_counts[n];
+                    MPI_Isend(&dd.ghost_fint_buffer_0[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[n]);
+                    MPI_Isend(&dd.ghost_fint_buffer_1[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[num_neighbors + n]);
+                    MPI_Isend(&dd.ghost_fint_buffer_2[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[2 * num_neighbors + n]);
+                    MPI_Irecv(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[3 * num_neighbors + n]);
+                    MPI_Irecv(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[4 * num_neighbors + n]);
+                    MPI_Irecv(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[5 * num_neighbors + n]);
+                    ghost_buf_offset += rc;
+                }
+                MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
+
+                // 受信データを所有節点の f_int に加算
+                for (int n = 0; n < num_neighbors; n++)
+                {
+                    int ss = send_starts[n];
+                    int sc = send_counts[n];
+                    if (sc > 0)
+                    {
+                        int g = (sc + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                        kernel_accumulate_fint_recv<<<g, BLOCK_SIZE>>>(
+                            sc, ss, dd.send_nodes,
+                            dd.send_buffer_0, dd.send_buffer_1, dd.send_buffer_2,
+                            dd.f_int_0, dd.f_int_1, dd.f_int_2);
+                    }
+                }
+                CUDA_CHECK(cudaDeviceSynchronize());
+            }
 
             double inner_loop_time = MPI_Wtime() - inner_loop_start_time;
             if (rank == 0)
@@ -2579,7 +2673,8 @@ int main(int argc, char *argv[])
             // delta uがゼロに近いなら収束とみなしてループを抜ける
             if (std::sqrt(delta_u_norm) < 1e-8)
             {
-                std::cout << "Converged" << std::endl;
+                if (rank == 0)
+                    std::cout << "Converged" << std::endl;
                 break;
             }
         }
@@ -2619,7 +2714,7 @@ int main(int argc, char *argv[])
                 CUDA_CHECK(cudaMemcpy(u_0, dd.u_prv_0, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(u_1, dd.u_prv_1, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(u_2, dd.u_prv_2, num_nodes * sizeof(double), cudaMemcpyDeviceToHost));
-                sprintf(vtk_filename, "%s/disp_step_%04d.vtk", output_dir, step);
+                sprintf(vtk_filename, "%s/disp_step_%04d_r%d.vtk", output_dir, step, rank);
                 write_vtk_displacement(vtk_filename, node_coords, num_nodes, ele_nodes, num_elements,
                                        u_0, u_1, u_2, t);
             }
@@ -2746,6 +2841,9 @@ int main(int argc, char *argv[])
     cudaFree(dd.send_buffer_0);
     cudaFree(dd.send_buffer_1);
     cudaFree(dd.send_buffer_2);
+    cudaFree(dd.ghost_fint_buffer_0);
+    cudaFree(dd.ghost_fint_buffer_1);
+    cudaFree(dd.ghost_fint_buffer_2);
     cudaFree(dd.d_reduce);
 
     // CPU メモリ解放
