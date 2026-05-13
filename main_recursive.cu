@@ -713,7 +713,8 @@ __global__ void compute_run_id_kernel(const int64_t *__restrict__ sorted_keys,
                                       int *__restrict__ run_id, int n)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= n) return;
+    if (s >= n)
+        return;
     run_id[s] = (s > 0 && sorted_keys[s] != sorted_keys[s - 1]) ? 1 : 0;
 }
 
@@ -725,7 +726,8 @@ __global__ void reset_bcrs_values_kernel(
     double *ke20, double *ke21, double *ke22)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nnz) return;
+    if (i >= nnz)
+        return;
     k00[i] = k01[i] = k02[i] = k10[i] = k11[i] = k12[i] = k20[i] = k21[i] = k22[i] = 0.0;
     ke00[i] = ke01[i] = ke02[i] = ke10[i] = ke11[i] = ke12[i] = ke20[i] = ke21[i] = ke22[i] = 0.0;
     m[i] = 0.0;
@@ -740,15 +742,28 @@ __global__ void scatter_coo_to_bcrs_kernel(
     double *ke20, double *ke21, double *ke22)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nnz_coo) return;
+    if (i >= nnz_coo)
+        return;
     int s = slot[i];
-    atomicAdd(&k00[s], kc[9*i+0]); atomicAdd(&k01[s], kc[9*i+1]); atomicAdd(&k02[s], kc[9*i+2]);
-    atomicAdd(&k10[s], kc[9*i+3]); atomicAdd(&k11[s], kc[9*i+4]); atomicAdd(&k12[s], kc[9*i+5]);
-    atomicAdd(&k20[s], kc[9*i+6]); atomicAdd(&k21[s], kc[9*i+7]); atomicAdd(&k22[s], kc[9*i+8]);
-    atomicAdd(&m[s],   mc[i]);
-    atomicAdd(&ke00[s], kec[9*i+0]); atomicAdd(&ke01[s], kec[9*i+1]); atomicAdd(&ke02[s], kec[9*i+2]);
-    atomicAdd(&ke10[s], kec[9*i+3]); atomicAdd(&ke11[s], kec[9*i+4]); atomicAdd(&ke12[s], kec[9*i+5]);
-    atomicAdd(&ke20[s], kec[9*i+6]); atomicAdd(&ke21[s], kec[9*i+7]); atomicAdd(&ke22[s], kec[9*i+8]);
+    atomicAdd(&k00[s], kc[9 * i + 0]);
+    atomicAdd(&k01[s], kc[9 * i + 1]);
+    atomicAdd(&k02[s], kc[9 * i + 2]);
+    atomicAdd(&k10[s], kc[9 * i + 3]);
+    atomicAdd(&k11[s], kc[9 * i + 4]);
+    atomicAdd(&k12[s], kc[9 * i + 5]);
+    atomicAdd(&k20[s], kc[9 * i + 6]);
+    atomicAdd(&k21[s], kc[9 * i + 7]);
+    atomicAdd(&k22[s], kc[9 * i + 8]);
+    atomicAdd(&m[s], mc[i]);
+    atomicAdd(&ke00[s], kec[9 * i + 0]);
+    atomicAdd(&ke01[s], kec[9 * i + 1]);
+    atomicAdd(&ke02[s], kec[9 * i + 2]);
+    atomicAdd(&ke10[s], kec[9 * i + 3]);
+    atomicAdd(&ke11[s], kec[9 * i + 4]);
+    atomicAdd(&ke12[s], kec[9 * i + 5]);
+    atomicAdd(&ke20[s], kec[9 * i + 6]);
+    atomicAdd(&ke21[s], kec[9 * i + 7]);
+    atomicAdd(&ke22[s], kec[9 * i + 8]);
 }
 
 __global__ void extract_bc_correction(
@@ -1404,11 +1419,11 @@ struct SortWorkspace
 {
     thrust::device_vector<int64_t> keys;
     thrust::device_vector<BlockVal> vals;
-    thrust::device_vector<int>      perm;
+    thrust::device_vector<int> perm;
     thrust::device_vector<BlockVal> vals_sorted;
     thrust::device_vector<int64_t> keys_out;
     thrust::device_vector<BlockVal> vals_out;
-    thrust::device_vector<int>      run_id;
+    thrust::device_vector<int> run_id;
 
     void init(int n)
     {
@@ -1656,11 +1671,10 @@ int pcg_solve(
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // GPU-aware MPI: デバイスポインタを直接送受信
+        // GPU-direct: デバイスポインタを直接送受信
         for (int n = 0; n < num_neighbors; n++)
         {
-            int ss = send_starts[n];
-            int sc = send_counts[n];
+            int ss = send_starts[n], sc = send_counts[n];
             MPI_Isend(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
             MPI_Isend(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
             MPI_Isend(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
@@ -2160,6 +2174,11 @@ int main(int argc, char *argv[])
         bc_val_u[0] = 0.0;
         bc_val_u[1] = disp_amp * sin(t) - disp_amp * sin(t - dt);
         bc_val_u[2] = 0.0;
+        // sin波は1周期分のみ入力する。
+        if (t > 2 * M_PI)
+        {
+            bc_val_u[1] = 0.0;
+        }
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β RHS構築
@@ -2271,22 +2290,22 @@ int main(int argc, char *argv[])
                 {
                     int g_bcrs = (nnz_bcrs + BLOCK_SIZE - 1) / BLOCK_SIZE;
                     reset_bcrs_values_kernel<<<g_bcrs, BLOCK_SIZE>>>(nnz_bcrs,
-                        dd.kval_00, dd.kval_01, dd.kval_02,
-                        dd.kval_10, dd.kval_11, dd.kval_12,
-                        dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
-                        dd.keval_00, dd.keval_01, dd.keval_02,
-                        dd.keval_10, dd.keval_11, dd.keval_12,
-                        dd.keval_20, dd.keval_21, dd.keval_22);
+                                                                     dd.kval_00, dd.kval_01, dd.kval_02,
+                                                                     dd.kval_10, dd.kval_11, dd.kval_12,
+                                                                     dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                                                                     dd.keval_00, dd.keval_01, dd.keval_02,
+                                                                     dd.keval_10, dd.keval_11, dd.keval_12,
+                                                                     dd.keval_20, dd.keval_21, dd.keval_22);
 
                     int g_coo = (nnz_coo + BLOCK_SIZE - 1) / BLOCK_SIZE;
                     scatter_coo_to_bcrs_kernel<<<g_coo, BLOCK_SIZE>>>(nnz_coo, dd.coo_to_bcrs_slot,
-                        dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
-                        dd.kval_00, dd.kval_01, dd.kval_02,
-                        dd.kval_10, dd.kval_11, dd.kval_12,
-                        dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
-                        dd.keval_00, dd.keval_01, dd.keval_02,
-                        dd.keval_10, dd.keval_11, dd.keval_12,
-                        dd.keval_20, dd.keval_21, dd.keval_22);
+                                                                      dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
+                                                                      dd.kval_00, dd.kval_01, dd.kval_02,
+                                                                      dd.kval_10, dd.kval_11, dd.kval_12,
+                                                                      dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                                                                      dd.keval_00, dd.keval_01, dd.keval_02,
+                                                                      dd.keval_10, dd.keval_11, dd.keval_12,
+                                                                      dd.keval_20, dd.keval_21, dd.keval_22);
                 }
 
                 extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
@@ -2372,6 +2391,11 @@ int main(int argc, char *argv[])
         bc_val_u[0] = 0.0;
         bc_val_u[1] = disp_amp * sin(t);
         bc_val_u[2] = 0.0;
+        // sin波は1周期分のみ入力する。
+        if (t > 2 * M_PI)
+        {
+            bc_val_u[1] = 0.0;
+        }
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β更新

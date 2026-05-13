@@ -1937,6 +1937,13 @@ int main(int argc, char *argv[])
         bc_val_a[0] = 0.0;
         bc_val_a[1] = -disp_amp * sin(t);
         bc_val_a[2] = 0.0;
+        // sin波は1周期分のみ入力する。
+        if (t > 2 * M_PI)
+        {
+            bc_val_u[1] = 0.0;
+            bc_val_v[1] = 0.0;
+            bc_val_a[1] = 0.0;
+        }
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.bc_val_v, bc_val_v, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.bc_val_a, bc_val_a, 3 * sizeof(double), cudaMemcpyHostToDevice));
