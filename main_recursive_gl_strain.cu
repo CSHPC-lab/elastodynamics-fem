@@ -105,11 +105,19 @@ struct DeviceData
     // 境界条件の値
     double *bc_val_u;
 
-    // MPI 通信用
+    // MPI 通信用（GPU側: pack/accumulate カーネル用）
     int *send_nodes;
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
     // f_int 逆方向通信用（ゴースト節点の f_int を送信するバッファ: total_recv サイズ）
     double *ghost_fint_buffer_0, *ghost_fint_buffer_1, *ghost_fint_buffer_2;
+
+    // CPU ピンメモリ（GPU-aware MPI を避けるための明示的ステージングバッファ）
+    // PCG ハロー交換用
+    double *h_send_0, *h_send_1, *h_send_2; // サイズ = total_send
+    double *h_recv_0, *h_recv_1, *h_recv_2; // サイズ = total_recv (ghost 領域に対応)
+    // f_int 逆方向通信用
+    double *h_ghost_fint_0, *h_ghost_fint_1, *h_ghost_fint_2; // total_recv
+    double *h_fint_recv_0, *h_fint_recv_1, *h_fint_recv_2;    // total_send
 
     // リダクション用
     double *d_reduce; // 小さいバッファ（3要素程度）
@@ -2032,17 +2040,29 @@ int pcg_solve(
         if (pt)
             pt->pack_buf += MPI_Wtime() - _t0;
 
-        // GPU-aware MPI: デバイスポインタを直接送受信
+        // D2H: GPU send_buffer → CPU ピンメモリ（GPU-aware MPI の暗黙 CUDA 操作を回避）
         for (int n = 0; n < num_neighbors; n++)
         {
-            int ss = send_starts[n];
-            int sc = send_counts[n];
-            MPI_Isend(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            MPI_Isend(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
-            MPI_Isend(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_0[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_1[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_2[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
+            int ss = send_starts[n], sc = send_counts[n];
+            if (sc > 0)
+            {
+                CUDA_CHECK(cudaMemcpy(dd.h_send_0 + ss, dd.send_buffer_0 + ss, sc * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(dd.h_send_1 + ss, dd.send_buffer_1 + ss, sc * sizeof(double), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(dd.h_send_2 + ss, dd.send_buffer_2 + ss, sc * sizeof(double), cudaMemcpyDeviceToHost));
+            }
+        }
+
+        // CPU ポインタで非ブロッキング送受信（GPU を巻き込まない）
+        for (int n = 0; n < num_neighbors; n++)
+        {
+            int ss = send_starts[n], sc = send_counts[n];
+            int h_ro = recv_starts[n] - num_owned; // host recv buffer 内オフセット
+            MPI_Isend(dd.h_send_0 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+            MPI_Isend(dd.h_send_1 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
+            MPI_Isend(dd.h_send_2 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
+            MPI_Irecv(dd.h_recv_0 + h_ro, recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
+            MPI_Irecv(dd.h_recv_1 + h_ro, recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
+            MPI_Irecv(dd.h_recv_2 + h_ro, recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
         }
 
         // --- 内側節点の SpMV + pAp (ハロー交換と並走) ---
@@ -2077,6 +2097,18 @@ int pcg_solve(
         MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
         if (pt)
             pt->halo_wait += MPI_Wtime() - _t0;
+
+        // H2D: CPU recv buffer → GPU p (ゴースト領域)
+        for (int n = 0; n < num_neighbors; n++)
+        {
+            int h_ro = recv_starts[n] - num_owned;
+            if (recv_counts[n] > 0)
+            {
+                CUDA_CHECK(cudaMemcpy(dd.p_0 + recv_starts[n], dd.h_recv_0 + h_ro, recv_counts[n] * sizeof(double), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(dd.p_1 + recv_starts[n], dd.h_recv_1 + h_ro, recv_counts[n] * sizeof(double), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(dd.p_2 + recv_starts[n], dd.h_recv_2 + h_ro, recv_counts[n] * sizeof(double), cudaMemcpyHostToDevice));
+            }
+        }
 
         // --- 外側節点の SpMV + pAp ---
         _t0 = MPI_Wtime();
@@ -2176,8 +2208,18 @@ int pcg_solve(
 }
 
 // ============================================================
-// ヘルパー: デバイスメモリ確保 + コピー
+// ヘルパー: デバイスメモリ確保 + コピー / ホストピンメモリ確保
 // ============================================================
+
+// CPU ピンメモリ確保（GPU-aware MPI を使わない明示的ステージング用）
+template <typename T>
+T *host_alloc_pinned(int n)
+{
+    T *ptr;
+    CUDA_CHECK(cudaHostAlloc(&ptr, n * sizeof(T), cudaHostAllocDefault));
+    return ptr;
+}
+
 template <typename T>
 T *device_alloc(int n)
 {
@@ -2607,6 +2649,20 @@ int main(int argc, char *argv[])
     dd.ghost_fint_buffer_1 = device_alloc_zero<double>(std::max(1, total_recv));
     dd.ghost_fint_buffer_2 = device_alloc_zero<double>(std::max(1, total_recv));
 
+    // CPU ピンメモリ（GPU-aware MPI を使わない明示的ステージング）
+    dd.h_send_0 = host_alloc_pinned<double>(std::max(1, total_send));
+    dd.h_send_1 = host_alloc_pinned<double>(std::max(1, total_send));
+    dd.h_send_2 = host_alloc_pinned<double>(std::max(1, total_send));
+    dd.h_recv_0 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_recv_1 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_recv_2 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_ghost_fint_0 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_ghost_fint_1 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_ghost_fint_2 = host_alloc_pinned<double>(std::max(1, total_recv));
+    dd.h_fint_recv_0 = host_alloc_pinned<double>(std::max(1, total_send));
+    dd.h_fint_recv_1 = host_alloc_pinned<double>(std::max(1, total_send));
+    dd.h_fint_recv_2 = host_alloc_pinned<double>(std::max(1, total_send));
+
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
 
@@ -2875,6 +2931,19 @@ int main(int argc, char *argv[])
                 }
                 CUDA_CHECK(cudaDeviceSynchronize());
 
+                // D2H: ghost_fint_buffer (GPU) → h_ghost_fint (CPU)
+                {
+                    int total_recv_local = 0;
+                    for (int n = 0; n < num_neighbors; n++)
+                        total_recv_local += recv_counts[n];
+                    if (total_recv_local > 0)
+                    {
+                        CUDA_CHECK(cudaMemcpy(dd.h_ghost_fint_0, dd.ghost_fint_buffer_0, total_recv_local * sizeof(double), cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(dd.h_ghost_fint_1, dd.ghost_fint_buffer_1, total_recv_local * sizeof(double), cudaMemcpyDeviceToHost));
+                        CUDA_CHECK(cudaMemcpy(dd.h_ghost_fint_2, dd.ghost_fint_buffer_2, total_recv_local * sizeof(double), cudaMemcpyDeviceToHost));
+                    }
+                }
+
                 double _t = MPI_Wtime();
                 ghost_buf_offset = 0;
                 for (int n = 0; n < num_neighbors; n++)
@@ -2882,17 +2951,30 @@ int main(int argc, char *argv[])
                     int rc = recv_counts[n];
                     int ss = send_starts[n];
                     int sc = send_counts[n];
-                    MPI_Isend(&dd.ghost_fint_buffer_0[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[n]);
-                    MPI_Isend(&dd.ghost_fint_buffer_1[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[num_neighbors + n]);
-                    MPI_Isend(&dd.ghost_fint_buffer_2[ghost_buf_offset], rc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[2 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[3 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[4 * num_neighbors + n]);
-                    MPI_Irecv(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[5 * num_neighbors + n]);
+                    // CPU ポインタで MPI 送受信（GPU-aware MPI を回避）
+                    MPI_Isend(dd.h_ghost_fint_0 + ghost_buf_offset, rc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[n]);
+                    MPI_Isend(dd.h_ghost_fint_1 + ghost_buf_offset, rc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[num_neighbors + n]);
+                    MPI_Isend(dd.h_ghost_fint_2 + ghost_buf_offset, rc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[2 * num_neighbors + n]);
+                    MPI_Irecv(dd.h_fint_recv_0 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 10, MPI_COMM_WORLD, &requests[3 * num_neighbors + n]);
+                    MPI_Irecv(dd.h_fint_recv_1 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 11, MPI_COMM_WORLD, &requests[4 * num_neighbors + n]);
+                    MPI_Irecv(dd.h_fint_recv_2 + ss, sc, MPI_DOUBLE, neighbor_ranks[n], 12, MPI_COMM_WORLD, &requests[5 * num_neighbors + n]);
                     ghost_buf_offset += rc;
                 }
                 MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
                 t_fint_mpi = MPI_Wtime() - _t;
 
+                // H2D: h_fint_recv → send_buffer (GPU) → kernel_accumulate_fint_recv
+                {
+                    int total_send_local = 0;
+                    for (int n = 0; n < num_neighbors; n++)
+                        total_send_local += send_counts[n];
+                    if (total_send_local > 0)
+                    {
+                        CUDA_CHECK(cudaMemcpy(dd.send_buffer_0, dd.h_fint_recv_0, total_send_local * sizeof(double), cudaMemcpyHostToDevice));
+                        CUDA_CHECK(cudaMemcpy(dd.send_buffer_1, dd.h_fint_recv_1, total_send_local * sizeof(double), cudaMemcpyHostToDevice));
+                        CUDA_CHECK(cudaMemcpy(dd.send_buffer_2, dd.h_fint_recv_2, total_send_local * sizeof(double), cudaMemcpyHostToDevice));
+                    }
+                }
                 for (int n = 0; n < num_neighbors; n++)
                 {
                     int ss = send_starts[n];
@@ -3142,6 +3224,10 @@ int main(int argc, char *argv[])
     cudaFree(dd.ghost_fint_buffer_1);
     cudaFree(dd.ghost_fint_buffer_2);
     cudaFree(dd.d_reduce);
+    cudaFreeHost(dd.h_send_0); cudaFreeHost(dd.h_send_1); cudaFreeHost(dd.h_send_2);
+    cudaFreeHost(dd.h_recv_0); cudaFreeHost(dd.h_recv_1); cudaFreeHost(dd.h_recv_2);
+    cudaFreeHost(dd.h_ghost_fint_0); cudaFreeHost(dd.h_ghost_fint_1); cudaFreeHost(dd.h_ghost_fint_2);
+    cudaFreeHost(dd.h_fint_recv_0); cudaFreeHost(dd.h_fint_recv_1); cudaFreeHost(dd.h_fint_recv_2);
 
     // CPU メモリ解放
     delete[] bc_flag;
