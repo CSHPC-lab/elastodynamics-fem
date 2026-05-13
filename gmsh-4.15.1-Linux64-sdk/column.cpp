@@ -6,11 +6,27 @@ export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
 #include <gmsh.h>
 #include <vector>
 #include <iostream>
+#include <cstdlib>
+#include <stdexcept>
+
+static std::size_t count_mesh_nodes()
+{
+    std::vector<std::size_t> nodeTags;
+    std::vector<double> coord;
+    std::vector<double> parametricCoord;
+    gmsh::model::mesh::getNodes(nodeTags, coord, parametricCoord,
+                                -1, -1, false, false);
+    return nodeTags.size();
+}
 
 int main(int argc, char **argv)
 {
     const double mesh_size = 2.0; // メッシュサイズの目安
-    const int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
+    int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
+    if (argc >= 2)
+        parallel_parts = std::atoi(argv[1]);
+    if (parallel_parts < 1)
+        throw std::runtime_error("parallel_parts must be >= 1");
 
     gmsh::initialize();
     gmsh::model::add("column");
@@ -40,11 +56,16 @@ int main(int argc, char **argv)
     // 3Dメッシュ生成
     gmsh::model::mesh::generate(3);
 
+    // 中間節点を直線上に配置（曲げない）
+    gmsh::option::setNumber("Mesh.SecondOrderLinear", 1);
+
     // 二次要素に変換（10節点四面体）
     gmsh::model::mesh::setOrder(2);
 
-    // 中間節点を直線上に配置（曲げない）
-    gmsh::option::setNumber("Mesh.SecondOrderLinear", 1);
+    // fragment や高次化で万一重複節点ができた場合は、partition前に必ず潰す。
+    gmsh::model::mesh::removeDuplicateNodes();
+    const std::size_t base_num_nodes = count_mesh_nodes();
+    std::cout << "base mesh nodes: " << base_num_nodes << std::endl;
 
     // 保存
     std::cout << "start writing..." << std::endl;
@@ -77,6 +98,20 @@ int main(int argc, char **argv)
     if (parallel_parts > 1)
     {
         gmsh::model::mesh::partition(parallel_parts);
+        // PartitionCreateTopology は境界上のpartitioned entityを作る。
+        // Gmshの設定やバージョンによって重複節点が残ると、単体メッシュと
+        // partitionメッシュが別問題になるので、出力前に再度潰して検査する。
+        gmsh::model::mesh::removeDuplicateNodes();
+    }
+
+    const std::size_t partitioned_num_nodes = count_mesh_nodes();
+    std::cout << "partitioned mesh nodes: " << partitioned_num_nodes << std::endl;
+    if (partitioned_num_nodes != base_num_nodes)
+    {
+        std::cerr << "ERROR: partitioning changed the number of mesh nodes: "
+                  << base_num_nodes << " -> " << partitioned_num_nodes << std::endl;
+        gmsh::finalize();
+        return 2;
     }
 
     // MSH 4.1 で出力
