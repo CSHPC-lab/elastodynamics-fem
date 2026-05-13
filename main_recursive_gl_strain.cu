@@ -2949,6 +2949,9 @@ int main(int argc, char *argv[])
                     ghost_buf_offset += rc;
                 }
                 MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
+                // GPU-aware MPI がデバイスメモリへ書いた受信バッファを、
+                // 後続の accumulate カーネルが確実に読むために同期する。
+                CUDA_CHECK(cudaDeviceSynchronize());
                 if (do_timing)
                     t_fint_mpi = MPI_Wtime() - _t;
 
