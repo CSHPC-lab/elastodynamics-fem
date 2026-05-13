@@ -2096,8 +2096,8 @@ int main(int argc, char *argv[])
     double c1 = cfg.get_double("c1");
     double c2 = cfg.get_double("c2");
     double rho = cfg.get_double("rho");
-    int target_node = get_local_id(mesh, cfg.get_int("target_node"));
-    int force_node = get_local_id(mesh, cfg.get_int("force_node"));
+    int target_node = get_owned_local_id(mesh, cfg.get_int("target_node"));
+    int force_node = get_owned_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
     double disp_amp = cfg.get_double("disp_amp");
@@ -2148,8 +2148,10 @@ int main(int argc, char *argv[])
     int num_ghost = mesh.num_ghost;
     int *ele_nodes = mesh.elem_ptr();
     int num_elements = mesh.num_total_elems;
+    int num_owned_elements = mesh.num_owned_elems;
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_elements = (num_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int grid_owned_elements = (num_owned_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     int num_neighbors = mesh.num_neighbors();
     int *neighbor_ranks = new int[num_neighbors];
@@ -2602,8 +2604,8 @@ int main(int argc, char *argv[])
             cudaMemset(dd.f_int_0, 0, num_nodes * sizeof(double));
             cudaMemset(dd.f_int_1, 0, num_nodes * sizeof(double));
             cudaMemset(dd.f_int_2, 0, num_nodes * sizeof(double));
-            compute_internal_force_kernel<<<grid_elements, BLOCK_SIZE>>>(
-                dd.node_coords, dd.ele_nodes, num_elements,
+            compute_internal_force_kernel<<<grid_owned_elements, BLOCK_SIZE>>>(
+                dd.node_coords, dd.ele_nodes, num_owned_elements,
                 dd.stress_xx, dd.stress_yy, dd.stress_zz,
                 dd.stress_xy, dd.stress_yz, dd.stress_zx,
                 dd.f_int_0, dd.f_int_1, dd.f_int_2);

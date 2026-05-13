@@ -454,3 +454,13 @@ int get_local_id(const FEMMesh &mesh, int global_id)
     auto it = mesh.global_to_local.find(global_id);
     return (it != mesh.global_to_local.end()) ? it->second : -1;
 }
+
+int get_owned_local_id(const FEMMesh &mesh, int global_id)
+{
+    auto it = mesh.global_to_local.find(global_id);
+    if (it == mesh.global_to_local.end())
+        return -1;
+
+    int local_id = it->second;
+    return (local_id < mesh.num_owned) ? local_id : -1;
+}

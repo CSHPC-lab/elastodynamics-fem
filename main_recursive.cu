@@ -1765,8 +1765,8 @@ int main(int argc, char *argv[])
     double c1 = cfg.get_double("c1");
     double c2 = cfg.get_double("c2");
     double rho = cfg.get_double("rho");
-    int target_node = get_local_id(mesh, cfg.get_int("target_node"));
-    int force_node = get_local_id(mesh, cfg.get_int("force_node"));
+    int target_node = get_owned_local_id(mesh, cfg.get_int("target_node"));
+    int force_node = get_owned_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
     double disp_amp = cfg.get_double("disp_amp");

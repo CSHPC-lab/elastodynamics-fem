@@ -119,6 +119,10 @@ __constant__ double c_dN0[30];
 __constant__ double c_dN1[30];
 __constant__ double c_dN2[30];
 __constant__ double c_dN3[30];
+__constant__ double c_N0[10];
+__constant__ double c_N1[10];
+__constant__ double c_N2[10];
+__constant__ double c_N3[10];
 
 // ============================================================
 // CUDA カーネル
@@ -235,6 +239,258 @@ __global__ void construct_mat(
                 kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
 
             mmat_coo_val[base + ij] = rho * mij * detJ;
+            coo_row[base + ij] = nidx[i];
+            coo_col[base + ij] = nidx[j];
+        }
+    }
+}
+
+// HRZ集中質量（解析スケール係数 35/18）
+__global__ void construct_mat_lumped(
+    const double *__restrict__ node_coords,
+    const int *__restrict__ ele_nodes,
+    const int num_elements,
+    const double lambda,
+    const double mu,
+    const double rho,
+    const double dt,
+    double *__restrict__ kmat_coo_val,
+    double *__restrict__ mmat_coo_val,
+    int *__restrict__ coo_row,
+    int *__restrict__ coo_col)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= num_elements)
+        return;
+
+    // 96 = 24 * 4 なので、kab * detJ_24 = mass_coeff * mii * detJ/24 = 4*rho*(35/18)/dt^2 * mii * detJ
+    const double mass_coeff = 96.0 * rho * (35.0 / 18.0) / (dt * dt);
+
+    int nidx[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+        nidx[i] = ele_nodes[elem * 10 + i];
+
+    double invJ[9], detJ;
+    {
+        double J[9], x0[3];
+        for (int d = 0; d < 3; d++)
+            x0[d] = node_coords[nidx[0] * 3 + d];
+        for (int i = 0; i < 3; i++)
+            for (int d = 0; d < 3; d++)
+                J[3 * i + d] = node_coords[nidx[i + 1] * 3 + d] - x0[d];
+        detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
+               J[1] * (J[5] * J[6] - J[3] * J[8]) +
+               J[2] * (J[3] * J[7] - J[4] * J[6]);
+        invJ[0] = (J[4] * J[8] - J[5] * J[7]) / detJ;
+        invJ[1] = (J[2] * J[7] - J[1] * J[8]) / detJ;
+        invJ[2] = (J[1] * J[5] - J[2] * J[4]) / detJ;
+        invJ[3] = (J[5] * J[6] - J[3] * J[8]) / detJ;
+        invJ[4] = (J[0] * J[8] - J[2] * J[6]) / detJ;
+        invJ[5] = (J[2] * J[3] - J[0] * J[5]) / detJ;
+        invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
+        invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
+        invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+    }
+    const double detJ_24 = detJ / 24.0;
+
+    double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
+    for (int d = 0; d < 3; d++)
+    {
+        const double c0 = invJ[3 * d], c1 = invJ[3 * d + 1], c2 = invJ[3 * d + 2];
+#pragma unroll
+        for (int n = 0; n < 10; n++)
+        {
+            ldN0[d * 10 + n] = c0 * c_dN0[n] + c1 * c_dN0[10 + n] + c2 * c_dN0[20 + n];
+            ldN1[d * 10 + n] = c0 * c_dN1[n] + c1 * c_dN1[10 + n] + c2 * c_dN1[20 + n];
+            ldN2[d * 10 + n] = c0 * c_dN2[n] + c1 * c_dN2[10 + n] + c2 * c_dN2[20 + n];
+            ldN3[d * 10 + n] = c0 * c_dN3[n] + c1 * c_dN3[10 + n] + c2 * c_dN3[20 + n];
+        }
+    }
+
+    const int base = elem * 100;
+
+    for (int i = 0; i < 10; i++)
+    {
+        for (int j = 0; j < 10; j++)
+        {
+            const int ij = i * 10 + j;
+            double kab[9] = {0.0};
+
+#pragma unroll
+            for (int gp = 0; gp < 4; gp++)
+            {
+                const double *ldn = (gp == 0) ? ldN0 : (gp == 1) ? ldN1
+                                                   : (gp == 2)   ? ldN2
+                                                                 : ldN3;
+                const double gi[3] = {ldn[i], ldn[10 + i], ldn[20 + i]};
+                const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
+                const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
+
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                {
+#pragma unroll
+                    for (int b = 0; b < 3; b++)
+                    {
+                        double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
+                        if (a == b)
+                            val += mu * dot;
+                        kab[3 * a + b] += val;
+                    }
+                }
+            }
+
+            if (i == j)
+            {
+                const double mii = c_mmat[ij];
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                    kab[3 * a + a] += mass_coeff * mii;
+                mmat_coo_val[base + ij] = rho * (35.0 / 18.0) * mii * detJ;
+            }
+            else
+            {
+                mmat_coo_val[base + ij] = 0.0;
+            }
+
+#pragma unroll
+            for (int k = 0; k < 9; k++)
+                kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+
+            coo_row[base + ij] = nidx[i];
+            coo_col[base + ij] = nidx[j];
+        }
+    }
+}
+
+// HRZ集中質量（FiSTR方式: 4点ガウス積分でconsistent massを評価してHRZ集中化）
+__global__ void construct_mat_second(
+    const double *__restrict__ node_coords,
+    const int *__restrict__ ele_nodes,
+    const int num_elements,
+    const double lambda,
+    const double mu,
+    const double rho,
+    const double dt,
+    double *__restrict__ kmat_coo_val,
+    double *__restrict__ mmat_coo_val,
+    int *__restrict__ coo_row,
+    int *__restrict__ coo_col)
+{
+    const int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    if (elem >= num_elements)
+        return;
+
+    int nidx[10];
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+        nidx[i] = ele_nodes[elem * 10 + i];
+
+    double invJ[9], detJ;
+    {
+        double J[9], x0[3];
+        for (int d = 0; d < 3; d++)
+            x0[d] = node_coords[nidx[0] * 3 + d];
+        for (int i = 0; i < 3; i++)
+            for (int d = 0; d < 3; d++)
+                J[3 * i + d] = node_coords[nidx[i + 1] * 3 + d] - x0[d];
+        detJ = J[0] * (J[4] * J[8] - J[5] * J[7]) +
+               J[1] * (J[5] * J[6] - J[3] * J[8]) +
+               J[2] * (J[3] * J[7] - J[4] * J[6]);
+        invJ[0] = (J[4] * J[8] - J[5] * J[7]) / detJ;
+        invJ[1] = (J[2] * J[7] - J[1] * J[8]) / detJ;
+        invJ[2] = (J[1] * J[5] - J[2] * J[4]) / detJ;
+        invJ[3] = (J[5] * J[6] - J[3] * J[8]) / detJ;
+        invJ[4] = (J[0] * J[8] - J[2] * J[6]) / detJ;
+        invJ[5] = (J[2] * J[3] - J[0] * J[5]) / detJ;
+        invJ[6] = (J[3] * J[7] - J[4] * J[6]) / detJ;
+        invJ[7] = (J[1] * J[6] - J[0] * J[7]) / detJ;
+        invJ[8] = (J[0] * J[4] - J[1] * J[3]) / detJ;
+    }
+    const double detJ_24 = detJ / 24.0;
+
+    double ldN0[30], ldN1[30], ldN2[30], ldN3[30];
+    for (int d = 0; d < 3; d++)
+    {
+        const double c0 = invJ[3 * d], c1 = invJ[3 * d + 1], c2 = invJ[3 * d + 2];
+#pragma unroll
+        for (int n = 0; n < 10; n++)
+        {
+            ldN0[d * 10 + n] = c0 * c_dN0[n] + c1 * c_dN0[10 + n] + c2 * c_dN0[20 + n];
+            ldN1[d * 10 + n] = c0 * c_dN1[n] + c1 * c_dN1[10 + n] + c2 * c_dN1[20 + n];
+            ldN2[d * 10 + n] = c0 * c_dN2[n] + c1 * c_dN2[10 + n] + c2 * c_dN2[20 + n];
+            ldN3[d * 10 + n] = c0 * c_dN3[n] + c1 * c_dN3[10 + n] + c2 * c_dN3[20 + n];
+        }
+    }
+
+    // FiSTR get_lumped_mass: diag_Mii[i] = (1/24)*detJ * ni_sq[i]
+    // scale = (detJ/6) / sum(diag_Mii) = 4 / sum(ni_sq)  ← detJ不依存
+    double ni_sq[10];
+    double ni_sq_sum = 0.0;
+#pragma unroll
+    for (int i = 0; i < 10; i++)
+    {
+        ni_sq[i] = c_N0[i] * c_N0[i] + c_N1[i] * c_N1[i] +
+                   c_N2[i] * c_N2[i] + c_N3[i] * c_N3[i];
+        ni_sq_sum += ni_sq[i];
+    }
+    const double scale = 4.0 / ni_sq_sum;
+    // kab * detJ_24 が質量寄与になるよう mass_coeff を設定
+    // 目標: mass_coeff * ni_sq[i] * detJ_24 = 4*rho/dt^2 * scale * (1/24)*detJ * ni_sq[i]
+    // → mass_coeff = 4*rho/dt^2 * scale
+    const double mass_coeff = 4.0 * rho / (dt * dt) * scale;
+
+    const int base = elem * 100;
+
+    for (int i = 0; i < 10; i++)
+    {
+        for (int j = 0; j < 10; j++)
+        {
+            const int ij = i * 10 + j;
+            double kab[9] = {0.0};
+
+#pragma unroll
+            for (int gp = 0; gp < 4; gp++)
+            {
+                const double *ldn = (gp == 0) ? ldN0 : (gp == 1) ? ldN1
+                                                   : (gp == 2)   ? ldN2
+                                                                 : ldN3;
+                const double gi[3] = {ldn[i], ldn[10 + i], ldn[20 + i]};
+                const double gj[3] = {ldn[j], ldn[10 + j], ldn[20 + j]};
+                const double dot = gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2];
+
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                {
+#pragma unroll
+                    for (int b = 0; b < 3; b++)
+                    {
+                        double val = lambda * gi[a] * gj[b] + mu * gi[b] * gj[a];
+                        if (a == b)
+                            val += mu * dot;
+                        kab[3 * a + b] += val;
+                    }
+                }
+            }
+
+            if (i == j)
+            {
+#pragma unroll
+                for (int a = 0; a < 3; a++)
+                    kab[3 * a + a] += mass_coeff * ni_sq[i];
+                // mmat = rho * scale * ni_sq[i] * detJ_24 = rho * scale * diag_Mii[i]
+                mmat_coo_val[base + ij] = rho * scale * ni_sq[i] * detJ_24;
+            }
+            else
+            {
+                mmat_coo_val[base + ij] = 0.0;
+            }
+
+#pragma unroll
+            for (int k = 0; k < 9; k++)
+                kmat_coo_val[9 * (base + ij) + k] = kab[k] * detJ_24;
+
             coo_row[base + ij] = nidx[i];
             coo_col[base + ij] = nidx[j];
         }
@@ -964,6 +1220,33 @@ void gauss_integrate(double dN0[30], double dN1[30], double dN2[30], double dN3[
     calculate_dN(dN3, gauss_points[3][0], gauss_points[3][1], gauss_points[3][2]);
 }
 
+void calculate_N(double N[10], double r, double s, double t)
+{
+    double a = 1.0 - r - s - t;
+    N[0] = (2.0 * a - 1.0) * a;
+    N[1] = (2.0 * r - 1.0) * r;
+    N[2] = (2.0 * s - 1.0) * s;
+    N[3] = (2.0 * t - 1.0) * t;
+    N[4] = 4.0 * r * a;
+    N[5] = 4.0 * r * s;
+    N[6] = 4.0 * s * a;
+    N[7] = 4.0 * t * a;
+    N[8] = 4.0 * r * t;
+    N[9] = 4.0 * s * t;
+}
+
+void gauss_integrate_N(double N0[10], double N1[10], double N2[10], double N3[10])
+{
+    double a = (5.0 - std::sqrt(5.0)) / 20.0;
+    double b = (5.0 + 3.0 * std::sqrt(5.0)) / 20.0;
+    double gauss_points[4][3] = {
+        {a, a, a}, {b, a, a}, {a, b, a}, {a, a, b}};
+    calculate_N(N0, gauss_points[0][0], gauss_points[0][1], gauss_points[0][2]);
+    calculate_N(N1, gauss_points[1][0], gauss_points[1][1], gauss_points[1][2]);
+    calculate_N(N2, gauss_points[2][0], gauss_points[2][1], gauss_points[2][2]);
+    calculate_N(N3, gauss_points[3][0], gauss_points[3][1], gauss_points[3][2]);
+}
+
 int sort_and_merge_bcoo(
     int nnz_coo, int num_nodes,
     int *coo_row, int *coo_col,
@@ -1354,14 +1637,35 @@ int main(int argc, char *argv[])
     double c1 = cfg.get_double("c1");
     double c2 = cfg.get_double("c2");
     double rho = cfg.get_double("rho");
-    int target_node = get_local_id(mesh, cfg.get_int("target_node"));
-    int force_node = get_local_id(mesh, cfg.get_int("force_node"));
+    int target_node = get_owned_local_id(mesh, cfg.get_int("target_node"));
+    int force_node = get_owned_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
     double force_magnitude = cfg.get_double("force_magnitude");
     double disp_amp = cfg.get_double("disp_amp");
     bool write_vtk = cfg.get_bool("write_vtk");
+    enum class MassVersion
+    {
+        CONSISTENT,
+        LUMPED,
+        SECOND
+    };
+    MassVersion mass_version = MassVersion::CONSISTENT;
+    if (cfg.has("mass"))
+    {
+        std::string mv = cfg.get_string("mass");
+        if (mv == "lumped")
+            mass_version = MassVersion::LUMPED;
+        else if (mv == "second")
+            mass_version = MassVersion::SECOND;
+    }
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
+    if (rank == 0)
+    {
+        const char *mv_str = (mass_version == MassVersion::LUMPED) ? "HRZ lumped (analytical)" : (mass_version == MassVersion::SECOND) ? "HRZ lumped (FiSTR 4-point Gauss)"
+                                                                                                                                       : "consistent";
+        printf("mass matrix: %s\n", mv_str);
+    }
 
     double lambda = rho * (c1 * c1 - 2 * c2 * c2);
     double mu = rho * c2 * c2;
@@ -1444,6 +1748,13 @@ int main(int argc, char *argv[])
     cudaMemcpyToSymbol(c_dN2, dN2, 30 * sizeof(double));
     cudaMemcpyToSymbol(c_dN3, dN3, 30 * sizeof(double));
 
+    double N0[10] = {0.0}, N1[10] = {0.0}, N2[10] = {0.0}, N3[10] = {0.0};
+    gauss_integrate_N(N0, N1, N2, N3);
+    cudaMemcpyToSymbol(c_N0, N0, 10 * sizeof(double));
+    cudaMemcpyToSymbol(c_N1, N1, 10 * sizeof(double));
+    cudaMemcpyToSymbol(c_N2, N2, 10 * sizeof(double));
+    cudaMemcpyToSymbol(c_N3, N3, 10 * sizeof(double));
+
     DeviceData dd;
     dd.node_coords = device_alloc_copy(node_coords, num_nodes * 3);
     dd.ele_nodes = device_alloc_copy(ele_nodes, num_elements * 10);
@@ -1458,9 +1769,18 @@ int main(int argc, char *argv[])
     // 基準となる座標をコピーして記録
     dd.ref_node_coords = device_alloc_copy(node_coords, num_nodes * 3);
 
-    construct_mat<<<grid_elements, BLOCK_SIZE>>>(
-        dd.node_coords, dd.ele_nodes, num_elements,
-        lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.coo_row, dd.coo_col);
+    if (mass_version == MassVersion::SECOND)
+        construct_mat_second<<<grid_elements, BLOCK_SIZE>>>(
+            dd.node_coords, dd.ele_nodes, num_elements,
+            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.coo_row, dd.coo_col);
+    else if (mass_version == MassVersion::LUMPED)
+        construct_mat_lumped<<<grid_elements, BLOCK_SIZE>>>(
+            dd.node_coords, dd.ele_nodes, num_elements,
+            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.coo_row, dd.coo_col);
+    else
+        construct_mat<<<grid_elements, BLOCK_SIZE>>>(
+            dd.node_coords, dd.ele_nodes, num_elements,
+            lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.coo_row, dd.coo_col);
 
     int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
                                        dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val);

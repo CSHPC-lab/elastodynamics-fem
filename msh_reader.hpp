@@ -69,5 +69,6 @@ struct FEMMesh
 FEMMesh read_msh(const std::string &filepath, int partition);
 void print_mesh_info(const FEMMesh &mesh);
 int get_local_id(const FEMMesh &mesh, int global_id);
+int get_owned_local_id(const FEMMesh &mesh, int global_id);
 
 #endif // MSH_READER_HPP
