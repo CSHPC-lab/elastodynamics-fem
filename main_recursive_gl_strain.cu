@@ -2894,6 +2894,9 @@ int main(int argc, char *argv[])
                     ghost_buf_offset += rc;
                 }
                 MPI_Waitall(6 * num_neighbors, requests, MPI_STATUSES_IGNORE);
+                // GPU-direct P2P でデバイスメモリに書き込まれたデータを
+                // カーネルが正しく読むために L2 をフラッシュ
+                CUDA_CHECK(cudaDeviceSynchronize());
                 if (do_timing)
                     t_fint_mpi = MPI_Wtime() - _t;
 
