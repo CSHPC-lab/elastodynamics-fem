@@ -57,6 +57,7 @@ struct DeviceData
     // COO行列
     int *coo_row, *coo_col;
     double *kmat_coo_val, *mmat_coo_val, *kemat_coo_val;
+    int *coo_to_bcrs_slot; // COOインデックス → BCRSスロットの事前計算マップ
 
     // BCRS 行列
     int *row_ptr, *col_ind;
@@ -761,6 +762,52 @@ __global__ void count_rows_kernel(
     if (k >= nnz)
         return;
     atomicAdd(&row_ptr[coo_row[k] + 1], 1);
+}
+
+// ソート済みキー列からBCRSスロットID（ランID）を計算する
+// run_id[s] = 1 if keys[s] != keys[s-1] else 0 → inclusive_scan後にBCRSスロット番号になる
+__global__ void compute_run_id_kernel(const int64_t *__restrict__ sorted_keys,
+                                      int *__restrict__ run_id, int n)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n) return;
+    run_id[s] = (s > 0 && sorted_keys[s] != sorted_keys[s - 1]) ? 1 : 0;
+}
+
+// BCRS値配列を一括ゼロクリアする（19本を1カーネルで処理）
+__global__ void reset_bcrs_values_kernel(
+    int nnz,
+    double *k00, double *k01, double *k02, double *k10, double *k11, double *k12,
+    double *k20, double *k21, double *k22, double *m,
+    double *ke00, double *ke01, double *ke02, double *ke10, double *ke11, double *ke12,
+    double *ke20, double *ke21, double *ke22)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    k00[i] = k01[i] = k02[i] = k10[i] = k11[i] = k12[i] = k20[i] = k21[i] = k22[i] = 0.0;
+    ke00[i] = ke01[i] = ke02[i] = ke10[i] = ke11[i] = ke12[i] = ke20[i] = ke21[i] = ke22[i] = 0.0;
+    m[i] = 0.0;
+}
+
+// 事前計算済みスロットマップを使いCOO値をBCRSに集約する（sort+merge不要）
+__global__ void scatter_coo_to_bcrs_kernel(
+    int nnz_coo, const int *__restrict__ slot,
+    const double *__restrict__ kc, const double *__restrict__ mc, const double *__restrict__ kec,
+    double *k00, double *k01, double *k02, double *k10, double *k11, double *k12,
+    double *k20, double *k21, double *k22, double *m,
+    double *ke00, double *ke01, double *ke02, double *ke10, double *ke11, double *ke12,
+    double *ke20, double *ke21, double *ke22)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz_coo) return;
+    int s = slot[i];
+    atomicAdd(&k00[s], kc[9*i+0]); atomicAdd(&k01[s], kc[9*i+1]); atomicAdd(&k02[s], kc[9*i+2]);
+    atomicAdd(&k10[s], kc[9*i+3]); atomicAdd(&k11[s], kc[9*i+4]); atomicAdd(&k12[s], kc[9*i+5]);
+    atomicAdd(&k20[s], kc[9*i+6]); atomicAdd(&k21[s], kc[9*i+7]); atomicAdd(&k22[s], kc[9*i+8]);
+    atomicAdd(&m[s],   mc[i]);
+    atomicAdd(&ke00[s], kec[9*i+0]); atomicAdd(&ke01[s], kec[9*i+1]); atomicAdd(&ke02[s], kec[9*i+2]);
+    atomicAdd(&ke10[s], kec[9*i+3]); atomicAdd(&ke11[s], kec[9*i+4]); atomicAdd(&ke12[s], kec[9*i+5]);
+    atomicAdd(&ke20[s], kec[9*i+6]); atomicAdd(&ke21[s], kec[9*i+7]); atomicAdd(&ke22[s], kec[9*i+8]);
 }
 
 __global__ void extract_bc_correction(
@@ -1688,52 +1735,84 @@ void gauss_integrate_N(double N0[10], double N1[10], double N2[10], double N3[10
     calculate_N(N3, gauss_points[3][0], gauss_points[3][1], gauss_points[3][2]);
 }
 
+// sort_and_merge_bcoo のワークスペース（main外部で一度だけ確保して使い回す）
+struct SortWorkspace
+{
+    thrust::device_vector<int64_t> keys;
+    thrust::device_vector<BlockVal> vals;
+    thrust::device_vector<int>      perm;
+    thrust::device_vector<BlockVal> vals_sorted;
+    thrust::device_vector<int64_t> keys_out;
+    thrust::device_vector<BlockVal> vals_out;
+    thrust::device_vector<int>      run_id;
+
+    void init(int n)
+    {
+        keys.resize(n);
+        vals.resize(n);
+        perm.resize(n);
+        vals_sorted.resize(n);
+        keys_out.resize(n);
+        vals_out.resize(n);
+        run_id.resize(n);
+    }
+};
+
+// d_coo_to_bcrs_slot が非nullptrの場合、初回呼び出し用として
+// COOインデックス→BCRSスロットのマッピングも計算する
 int sort_and_merge_bcoo(
     int nnz_coo, int num_nodes,
     int *coo_row, int *coo_col,
-    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val)
+    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val,
+    SortWorkspace &ws,
+    int *d_coo_to_bcrs_slot = nullptr)
 {
-    thrust::device_vector<int64_t> keys(nnz_coo);
-    thrust::device_vector<BlockVal> vals(nnz_coo);
-
     int block = 256;
     int grid = (nnz_coo + block - 1) / block;
     pack_coo<<<grid, block>>>(
         coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
-        thrust::raw_pointer_cast(keys.data()),
-        thrust::raw_pointer_cast(vals.data()),
+        thrust::raw_pointer_cast(ws.keys.data()),
+        thrust::raw_pointer_cast(ws.vals.data()),
         nnz_coo, num_nodes);
     CUDA_CHECK(cudaGetLastError());
 
-    // ★変更点★ 軽い (int64, int) ペアだけでソートする
-    thrust::device_vector<int> perm(nnz_coo);
-    thrust::sequence(perm.begin(), perm.end());
-    thrust::sort_by_key(keys.begin(), keys.end(), perm.begin());
+    thrust::sequence(ws.perm.begin(), ws.perm.end());
+    thrust::sort_by_key(ws.keys.begin(), ws.keys.end(), ws.perm.begin());
 
-    // perm に従って BlockVal を並び替え（ここは radix_sort を介さないので安全）
-    thrust::device_vector<BlockVal> vals_sorted(nnz_coo);
-    thrust::gather(perm.begin(), perm.end(),
-                   vals.begin(), vals_sorted.begin());
-    vals.swap(vals_sorted);
-
-    // 以降は今までと同じ。reduce_by_key は radix_sort を使わないので BlockVal で OK
-    thrust::device_vector<int64_t> keys_out(nnz_coo);
-    thrust::device_vector<BlockVal> vals_out(nnz_coo);
+    thrust::gather(ws.perm.begin(), ws.perm.end(),
+                   ws.vals.begin(), ws.vals_sorted.begin());
+    ws.vals.swap(ws.vals_sorted);
 
     auto end = thrust::reduce_by_key(
-        keys.begin(), keys.end(),
-        vals.begin(),
-        keys_out.begin(),
-        vals_out.begin());
+        ws.keys.begin(), ws.keys.end(),
+        ws.vals.begin(),
+        ws.keys_out.begin(),
+        ws.vals_out.begin());
 
-    int nnz_bcrs = end.first - keys_out.begin();
+    int nnz_bcrs = end.first - ws.keys_out.begin();
 
     grid = (nnz_bcrs + block - 1) / block;
     unpack_bcrs<<<grid, block>>>(
-        thrust::raw_pointer_cast(keys_out.data()),
-        thrust::raw_pointer_cast(vals_out.data()),
+        thrust::raw_pointer_cast(ws.keys_out.data()),
+        thrust::raw_pointer_cast(ws.vals_out.data()),
         coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
         nnz_bcrs, num_nodes);
+
+    // 初回のみ: COO元インデックス→BCRSスロットのマッピングを計算
+    if (d_coo_to_bcrs_slot)
+    {
+        // keys はソート済み。run_id[s] = BCRSスロット番号
+        int g = (nnz_coo + block - 1) / block;
+        compute_run_id_kernel<<<g, block>>>(
+            thrust::raw_pointer_cast(ws.keys.data()),
+            thrust::raw_pointer_cast(ws.run_id.data()), nnz_coo);
+        thrust::inclusive_scan(ws.run_id.begin(), ws.run_id.end(), ws.run_id.begin());
+
+        // d_coo_to_bcrs_slot[perm[s]] = run_id[s]
+        thrust::scatter(ws.run_id.begin(), ws.run_id.end(),
+                        ws.perm.begin(),
+                        thrust::device_pointer_cast(d_coo_to_bcrs_slot));
+    }
 
     return nnz_bcrs;
 }
@@ -2069,6 +2148,79 @@ T *device_alloc_zero(int n)
 }
 
 // ============================================================
+// GPU メモリ使用量の事前見積もり
+// ============================================================
+// BlockVal = k[9] + m + ke[9] = 19 doubles = 152 bytes
+static const int BLOCK_VAL_BYTES = 19 * 8 + 8; // 160 bytes (struct padding考慮)
+
+void print_memory_estimate(int num_nodes, int num_elements,
+                           int total_send, int total_recv, int rank)
+{
+    if (rank != 0) return;
+
+    const int    nnz_coo  = 100 * num_elements;
+    auto toMB = [](size_t b) -> double { return b / (1024.0 * 1024.0); };
+
+    // ── ノード系ベクタ（常駐） ──────────────────────────────
+    // double × 63本: node_coords×3, ref×3, u_tmp/v_tmp/a_tmp/u_prv/delta_u 各×3,
+    //                rhs/tmp/rhs_orig/f_int/r/z/p/Ap 各×3, bc_corr×9, inv_diag×9
+    // int    × 1本: bc_flag
+    const size_t node_bytes = (size_t)num_nodes * (63 * 8 + 4);
+
+    // ── 要素系（常駐） ──────────────────────────────────────
+    // ele_nodes: 10 int/elem, stress 6成分×4積分点×double/elem
+    const size_t elem_bytes = (size_t)num_elements * (10 * 4 + 6 * 4 * 8);
+
+    // ── COO一時バッファ（常駐: 毎反復 construct_mat で書き直す） ──
+    // kmat×9 + mmat×1 + kemat×9 = 19 double, coo_row + coo_col + coo_to_bcrs_slot = 3 int
+    const size_t coo_bytes = (size_t)nnz_coo * (19 * 8 + 3 * 4);
+
+    // ── SortWorkspace（常駐: 前処理後も保持） ──────────────
+    // keys×2(int64) + vals×3(BlockVal) + perm+run_id×2(int)
+    const size_t sort_bytes = (size_t)nnz_coo * (2 * 8 + 3 * BLOCK_VAL_BYTES + 2 * 4);
+
+    // ── BCRS行列（常駐, nnz_bcrs エントリ） ─────────────────
+    // kval×9 + keval×9 + mval = 19 double, col_ind = 1 int → 156 bytes/entry
+    // nnz_bcrs は sort_and_merge 後に確定。上限 = nnz_coo（全エントリが一意の場合）
+    const size_t bcrs_bytes_ub = (size_t)nnz_coo * (19 * 8 + 4)
+                                 + (size_t)(num_nodes + 1) * 4;
+
+    // ── MPI通信バッファ（常駐） ──────────────────────────────
+    // send_nodes(int) + send_buffer×3(double) + ghost_fint_buffer×3(double) + d_reduce/bc_val_u
+    const size_t mpi_bytes = (size_t)total_send * (4 + 3 * 8)
+                           + (size_t)total_recv * (3 * 8)
+                           + 64;
+
+    const size_t total_bytes = node_bytes + elem_bytes + coo_bytes
+                             + sort_bytes + bcrs_bytes_ub + mpi_bytes;
+
+    size_t gpu_free = 0, gpu_total = 0;
+    cudaMemGetInfo(&gpu_free, &gpu_total);
+
+    printf("\n========== GPU メモリ見積もり (rank 0 / per-GPU) ==========\n");
+    printf("  ノード系ベクタ          : %7.1f MB  (num_nodes=%d)\n",
+           toMB(node_bytes), num_nodes);
+    printf("  要素系バッファ          : %7.1f MB  (num_elements=%d, nnz_coo=%d)\n",
+           toMB(elem_bytes), num_elements, nnz_coo);
+    printf("  COOバッファ（常駐）     : %7.1f MB\n", toMB(coo_bytes));
+    printf("  SortWorkspace（常駐）   : %7.1f MB\n", toMB(sort_bytes));
+    printf("  BCRS行列（上限）        : %7.1f MB  (nnz_bcrs <= nnz_coo 想定)\n",
+           toMB(bcrs_bytes_ub));
+    printf("  MPI通信バッファ         : %7.1f MB  (send=%d, recv=%d nodes)\n",
+           toMB(mpi_bytes), total_send, total_recv);
+    printf("  ─────────────────────────────────────────────────────\n");
+    printf("  合計推定上限            : %7.1f MB\n", toMB(total_bytes));
+    printf("  GPU 搭載容量            : %7.1f MB\n", toMB(gpu_total));
+    printf("  現在の空き              : %7.1f MB\n", toMB(gpu_free));
+    if (total_bytes > gpu_free)
+        printf("  *** 警告: 推定使用量が現在の空き容量を超えています ***\n");
+    else
+        printf("  マージン（空き - 推定）: %7.1f MB\n", toMB(gpu_free - total_bytes));
+    printf("  ※ BCRS実際サイズは初回 sort 後に表示されます\n");
+    printf("============================================================\n\n");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main(int argc, char *argv[])
@@ -2178,6 +2330,9 @@ int main(int argc, char *argv[])
         total_recv += recv_counts[i];
     int *send_nodes_ptr = send_nodes_vec.data();
 
+    // GPU メモリ使用量の事前見積もり（全アロケーションの前に表示）
+    print_memory_estimate(num_nodes, num_elements, total_send, total_recv, rank);
+
     if (target_node >= 0)
     {
         printf("Target node local ID: %d\n", target_node);
@@ -2225,11 +2380,17 @@ int main(int argc, char *argv[])
     dd.bc_flag = device_alloc_copy(bc_flag, num_nodes);
 
     // 剛性行列、質量行列計算
-    dd.kmat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
-    dd.mmat_coo_val = device_alloc_zero<double>(100 * num_elements);
-    dd.kemat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
-    dd.coo_row = device_alloc_zero<int>(100 * num_elements);
-    dd.coo_col = device_alloc_zero<int>(100 * num_elements);
+    const int nnz_coo = 100 * num_elements;
+    dd.kmat_coo_val = device_alloc_zero<double>(nnz_coo * 9);
+    dd.mmat_coo_val = device_alloc_zero<double>(nnz_coo);
+    dd.kemat_coo_val = device_alloc_zero<double>(nnz_coo * 9);
+    dd.coo_row = device_alloc_zero<int>(nnz_coo);
+    dd.coo_col = device_alloc_zero<int>(nnz_coo);
+    dd.coo_to_bcrs_slot = device_alloc<int>(nnz_coo);
+
+    // sort_and_merge ワークスペースを事前確保（以降は毎回使い回す）
+    SortWorkspace ws;
+    ws.init(nnz_coo);
 
     // 基準となる座標をコピーして記録
     dd.ref_node_coords = device_alloc_copy(node_coords, num_nodes * 3);
@@ -2270,8 +2431,10 @@ int main(int argc, char *argv[])
             dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
             dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
-    int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+    // 初回：スパース構造（row_ptr, col_ind）とスロットマップを確定させる
+    int nnz_bcrs = sort_and_merge_bcoo(nnz_coo, num_nodes,
+                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
+                                       ws, dd.coo_to_bcrs_slot);
 
     dd.kval_00 = device_alloc_zero<double>(nnz_bcrs);
     dd.kval_01 = device_alloc_zero<double>(nnz_bcrs);
@@ -2396,6 +2559,14 @@ int main(int argc, char *argv[])
     double preprocessing_time = MPI_Wtime() - start_time;
     if (rank == 0)
     {
+        // 全アロケーション完了後の実際の GPU 使用量を表示
+        size_t gpu_free_after, gpu_total_after;
+        cudaMemGetInfo(&gpu_free_after, &gpu_total_after);
+        printf("[rank 0] GPU 使用量（全アロケーション後）: %.1f MB / %.1f MB\n",
+               (gpu_total_after - gpu_free_after) / (1024.0 * 1024.0),
+               gpu_total_after / (1024.0 * 1024.0));
+        printf("[rank 0] BCRS 実サイズ: nnz_bcrs=%d → %.1f MB (kval+keval+mval+col_ind)\n",
+               nnz_bcrs, nnz_bcrs * (19 * 8.0 + 4) / (1024.0 * 1024.0));
         std::cout << "Preprocessing time: " << preprocessing_time << " seconds" << std::endl;
     }
 
@@ -2561,18 +2732,28 @@ int main(int argc, char *argv[])
                     dd.node_coords, dd.ref_node_coords, dd.stress_xx, dd.stress_yy, dd.stress_zz, dd.stress_xy, dd.stress_yz, dd.stress_zx,
                     dd.ele_nodes, num_elements, lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
-            int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                               dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+            // 2回目以降の内側ループ：スパース構造は固定済みなので値のみ更新
+            // sort_and_merge + build_bcrs の代わりにリセット＋scatter で高速化
+            {
+                int g_bcrs = (nnz_bcrs + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                reset_bcrs_values_kernel<<<g_bcrs, BLOCK_SIZE>>>(nnz_bcrs,
+                    dd.kval_00, dd.kval_01, dd.kval_02,
+                    dd.kval_10, dd.kval_11, dd.kval_12,
+                    dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                    dd.keval_00, dd.keval_01, dd.keval_02,
+                    dd.keval_10, dd.keval_11, dd.keval_12,
+                    dd.keval_20, dd.keval_21, dd.keval_22);
 
-            build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
-                       dd.row_ptr, dd.col_ind,
-                       dd.kval_00, dd.kval_01, dd.kval_02,
-                       dd.kval_10, dd.kval_11, dd.kval_12,
-                       dd.kval_20, dd.kval_21, dd.kval_22,
-                       dd.mval,
-                       dd.keval_00, dd.keval_01, dd.keval_02,
-                       dd.keval_10, dd.keval_11, dd.keval_12,
-                       dd.keval_20, dd.keval_21, dd.keval_22);
+                int g_coo = (nnz_coo + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                scatter_coo_to_bcrs_kernel<<<g_coo, BLOCK_SIZE>>>(nnz_coo, dd.coo_to_bcrs_slot,
+                    dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
+                    dd.kval_00, dd.kval_01, dd.kval_02,
+                    dd.kval_10, dd.kval_11, dd.kval_12,
+                    dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                    dd.keval_00, dd.keval_01, dd.keval_02,
+                    dd.keval_10, dd.keval_11, dd.keval_12,
+                    dd.keval_20, dd.keval_21, dd.keval_22);
+            }
 
             extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
                 num_nodes, dd.row_ptr, dd.col_ind,
@@ -2753,6 +2934,7 @@ int main(int argc, char *argv[])
     // ============================================================
     // GPU メモリ解放
     // ============================================================
+    cudaFree(dd.coo_to_bcrs_slot);
     cudaFree(dd.row_ptr);
     cudaFree(dd.col_ind);
     cudaFree(dd.kval_00);

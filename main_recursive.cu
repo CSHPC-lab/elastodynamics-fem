@@ -57,6 +57,7 @@ struct DeviceData
     // COO行列
     int *coo_row, *coo_col;
     double *kmat_coo_val, *mmat_coo_val, *kemat_coo_val;
+    int *coo_to_bcrs_slot; // COOインデックス → BCRSスロットの事前計算マップ
 
     // BCRS 行列
     int *row_ptr, *col_ind;
@@ -708,6 +709,48 @@ __global__ void count_rows_kernel(
     atomicAdd(&row_ptr[coo_row[k] + 1], 1);
 }
 
+__global__ void compute_run_id_kernel(const int64_t *__restrict__ sorted_keys,
+                                      int *__restrict__ run_id, int n)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n) return;
+    run_id[s] = (s > 0 && sorted_keys[s] != sorted_keys[s - 1]) ? 1 : 0;
+}
+
+__global__ void reset_bcrs_values_kernel(
+    int nnz,
+    double *k00, double *k01, double *k02, double *k10, double *k11, double *k12,
+    double *k20, double *k21, double *k22, double *m,
+    double *ke00, double *ke01, double *ke02, double *ke10, double *ke11, double *ke12,
+    double *ke20, double *ke21, double *ke22)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    k00[i] = k01[i] = k02[i] = k10[i] = k11[i] = k12[i] = k20[i] = k21[i] = k22[i] = 0.0;
+    ke00[i] = ke01[i] = ke02[i] = ke10[i] = ke11[i] = ke12[i] = ke20[i] = ke21[i] = ke22[i] = 0.0;
+    m[i] = 0.0;
+}
+
+__global__ void scatter_coo_to_bcrs_kernel(
+    int nnz_coo, const int *__restrict__ slot,
+    const double *__restrict__ kc, const double *__restrict__ mc, const double *__restrict__ kec,
+    double *k00, double *k01, double *k02, double *k10, double *k11, double *k12,
+    double *k20, double *k21, double *k22, double *m,
+    double *ke00, double *ke01, double *ke02, double *ke10, double *ke11, double *ke12,
+    double *ke20, double *ke21, double *ke22)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nnz_coo) return;
+    int s = slot[i];
+    atomicAdd(&k00[s], kc[9*i+0]); atomicAdd(&k01[s], kc[9*i+1]); atomicAdd(&k02[s], kc[9*i+2]);
+    atomicAdd(&k10[s], kc[9*i+3]); atomicAdd(&k11[s], kc[9*i+4]); atomicAdd(&k12[s], kc[9*i+5]);
+    atomicAdd(&k20[s], kc[9*i+6]); atomicAdd(&k21[s], kc[9*i+7]); atomicAdd(&k22[s], kc[9*i+8]);
+    atomicAdd(&m[s],   mc[i]);
+    atomicAdd(&ke00[s], kec[9*i+0]); atomicAdd(&ke01[s], kec[9*i+1]); atomicAdd(&ke02[s], kec[9*i+2]);
+    atomicAdd(&ke10[s], kec[9*i+3]); atomicAdd(&ke11[s], kec[9*i+4]); atomicAdd(&ke12[s], kec[9*i+5]);
+    atomicAdd(&ke20[s], kec[9*i+6]); atomicAdd(&ke21[s], kec[9*i+7]); atomicAdd(&ke22[s], kec[9*i+8]);
+}
+
 __global__ void extract_bc_correction(
     int num_nodes,
     const int *__restrict__ row_ptr,
@@ -1357,52 +1400,77 @@ void gauss_integrate_N(double N0[10], double N1[10], double N2[10], double N3[10
     calculate_N(N3, gauss_points[3][0], gauss_points[3][1], gauss_points[3][2]);
 }
 
+struct SortWorkspace
+{
+    thrust::device_vector<int64_t> keys;
+    thrust::device_vector<BlockVal> vals;
+    thrust::device_vector<int>      perm;
+    thrust::device_vector<BlockVal> vals_sorted;
+    thrust::device_vector<int64_t> keys_out;
+    thrust::device_vector<BlockVal> vals_out;
+    thrust::device_vector<int>      run_id;
+
+    void init(int n)
+    {
+        keys.resize(n);
+        vals.resize(n);
+        perm.resize(n);
+        vals_sorted.resize(n);
+        keys_out.resize(n);
+        vals_out.resize(n);
+        run_id.resize(n);
+    }
+};
+
 int sort_and_merge_bcoo(
     int nnz_coo, int num_nodes,
     int *coo_row, int *coo_col,
-    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val)
+    double *kmat_coo_val, double *mmat_coo_val, double *kemat_coo_val,
+    SortWorkspace &ws,
+    int *d_coo_to_bcrs_slot = nullptr)
 {
-    thrust::device_vector<int64_t> keys(nnz_coo);
-    thrust::device_vector<BlockVal> vals(nnz_coo);
-
     int block = 256;
     int grid = (nnz_coo + block - 1) / block;
     pack_coo<<<grid, block>>>(
         coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
-        thrust::raw_pointer_cast(keys.data()),
-        thrust::raw_pointer_cast(vals.data()),
+        thrust::raw_pointer_cast(ws.keys.data()),
+        thrust::raw_pointer_cast(ws.vals.data()),
         nnz_coo, num_nodes);
     CUDA_CHECK(cudaGetLastError());
 
-    // ★変更点★ 軽い (int64, int) ペアだけでソートする
-    thrust::device_vector<int> perm(nnz_coo);
-    thrust::sequence(perm.begin(), perm.end());
-    thrust::sort_by_key(keys.begin(), keys.end(), perm.begin());
+    thrust::sequence(ws.perm.begin(), ws.perm.end());
+    thrust::sort_by_key(ws.keys.begin(), ws.keys.end(), ws.perm.begin());
 
-    // perm に従って BlockVal を並び替え（ここは radix_sort を介さないので安全）
-    thrust::device_vector<BlockVal> vals_sorted(nnz_coo);
-    thrust::gather(perm.begin(), perm.end(),
-                   vals.begin(), vals_sorted.begin());
-    vals.swap(vals_sorted);
-
-    // 以降は今までと同じ。reduce_by_key は radix_sort を使わないので BlockVal で OK
-    thrust::device_vector<int64_t> keys_out(nnz_coo);
-    thrust::device_vector<BlockVal> vals_out(nnz_coo);
+    thrust::gather(ws.perm.begin(), ws.perm.end(),
+                   ws.vals.begin(), ws.vals_sorted.begin());
+    ws.vals.swap(ws.vals_sorted);
 
     auto end = thrust::reduce_by_key(
-        keys.begin(), keys.end(),
-        vals.begin(),
-        keys_out.begin(),
-        vals_out.begin());
+        ws.keys.begin(), ws.keys.end(),
+        ws.vals.begin(),
+        ws.keys_out.begin(),
+        ws.vals_out.begin());
 
-    int nnz_bcrs = end.first - keys_out.begin();
+    int nnz_bcrs = end.first - ws.keys_out.begin();
 
     grid = (nnz_bcrs + block - 1) / block;
     unpack_bcrs<<<grid, block>>>(
-        thrust::raw_pointer_cast(keys_out.data()),
-        thrust::raw_pointer_cast(vals_out.data()),
+        thrust::raw_pointer_cast(ws.keys_out.data()),
+        thrust::raw_pointer_cast(ws.vals_out.data()),
         coo_row, coo_col, kmat_coo_val, mmat_coo_val, kemat_coo_val,
         nnz_bcrs, num_nodes);
+
+    if (d_coo_to_bcrs_slot)
+    {
+        int g = (nnz_coo + block - 1) / block;
+        compute_run_id_kernel<<<g, block>>>(
+            thrust::raw_pointer_cast(ws.keys.data()),
+            thrust::raw_pointer_cast(ws.run_id.data()), nnz_coo);
+        thrust::inclusive_scan(ws.run_id.begin(), ws.run_id.end(), ws.run_id.begin());
+        thrust::scatter(ws.run_id.begin(), ws.run_id.end(),
+                        ws.perm.begin(),
+                        thrust::device_pointer_cast(d_coo_to_bcrs_slot));
+    }
 
     return nnz_bcrs;
 }
@@ -1890,11 +1958,16 @@ int main(int argc, char *argv[])
     dd.bc_flag = device_alloc_copy(bc_flag, num_nodes);
 
     // 剛性行列、質量行列計算
-    dd.kmat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
-    dd.mmat_coo_val = device_alloc_zero<double>(100 * num_elements);
-    dd.kemat_coo_val = device_alloc_zero<double>(100 * num_elements * 9);
-    dd.coo_row = device_alloc_zero<int>(100 * num_elements);
-    dd.coo_col = device_alloc_zero<int>(100 * num_elements);
+    const int nnz_coo = 100 * num_elements;
+    dd.kmat_coo_val = device_alloc_zero<double>(nnz_coo * 9);
+    dd.mmat_coo_val = device_alloc_zero<double>(nnz_coo);
+    dd.kemat_coo_val = device_alloc_zero<double>(nnz_coo * 9);
+    dd.coo_row = device_alloc_zero<int>(nnz_coo);
+    dd.coo_col = device_alloc_zero<int>(nnz_coo);
+    dd.coo_to_bcrs_slot = device_alloc<int>(nnz_coo);
+
+    SortWorkspace ws;
+    ws.init(nnz_coo);
 
     // 基準となる座標をコピーして記録
     dd.ref_node_coords = device_alloc_copy(node_coords, num_nodes * 3);
@@ -1932,8 +2005,9 @@ int main(int argc, char *argv[])
             dd.ele_nodes, num_elements,
             lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
-    int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+    int nnz_bcrs = sort_and_merge_bcoo(nnz_coo, num_nodes,
+                                       dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
+                                       ws, dd.coo_to_bcrs_slot);
 
     dd.kval_00 = device_alloc_zero<double>(nnz_bcrs);
     dd.kval_01 = device_alloc_zero<double>(nnz_bcrs);
@@ -2194,18 +2268,26 @@ int main(int argc, char *argv[])
                         dd.ele_nodes, num_elements,
                         lambda, mu, rho, dt, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, dd.coo_row, dd.coo_col);
 
-                int nnz_bcrs = sort_and_merge_bcoo(100 * num_elements, num_nodes,
-                                                   dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val);
+                {
+                    int g_bcrs = (nnz_bcrs + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                    reset_bcrs_values_kernel<<<g_bcrs, BLOCK_SIZE>>>(nnz_bcrs,
+                        dd.kval_00, dd.kval_01, dd.kval_02,
+                        dd.kval_10, dd.kval_11, dd.kval_12,
+                        dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                        dd.keval_00, dd.keval_01, dd.keval_02,
+                        dd.keval_10, dd.keval_11, dd.keval_12,
+                        dd.keval_20, dd.keval_21, dd.keval_22);
 
-                build_bcrs(dd.coo_row, dd.coo_col, dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val, nnz_bcrs, num_nodes,
-                           dd.row_ptr, dd.col_ind,
-                           dd.kval_00, dd.kval_01, dd.kval_02,
-                           dd.kval_10, dd.kval_11, dd.kval_12,
-                           dd.kval_20, dd.kval_21, dd.kval_22,
-                           dd.mval,
-                           dd.keval_00, dd.keval_01, dd.keval_02,
-                           dd.keval_10, dd.keval_11, dd.keval_12,
-                           dd.keval_20, dd.keval_21, dd.keval_22);
+                    int g_coo = (nnz_coo + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                    scatter_coo_to_bcrs_kernel<<<g_coo, BLOCK_SIZE>>>(nnz_coo, dd.coo_to_bcrs_slot,
+                        dd.kmat_coo_val, dd.mmat_coo_val, dd.kemat_coo_val,
+                        dd.kval_00, dd.kval_01, dd.kval_02,
+                        dd.kval_10, dd.kval_11, dd.kval_12,
+                        dd.kval_20, dd.kval_21, dd.kval_22, dd.mval,
+                        dd.keval_00, dd.keval_01, dd.keval_02,
+                        dd.keval_10, dd.keval_11, dd.keval_12,
+                        dd.keval_20, dd.keval_21, dd.keval_22);
+                }
 
                 extract_bc_correction<<<grid_nodes, BLOCK_SIZE>>>(
                     num_nodes, dd.row_ptr, dd.col_ind,
@@ -2358,6 +2440,7 @@ int main(int argc, char *argv[])
     // ============================================================
     // GPU メモリ解放
     // ============================================================
+    cudaFree(dd.coo_to_bcrs_slot);
     cudaFree(dd.row_ptr);
     cudaFree(dd.col_ind);
     cudaFree(dd.kval_00);
