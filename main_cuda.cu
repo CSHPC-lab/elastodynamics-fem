@@ -92,14 +92,9 @@ struct DeviceData
     // 境界条件の値
     double *bc_val_u, *bc_val_v, *bc_val_a;
 
-    // MPI 通信用（GPU バッファ）
+    // MPI 通信用
     int *send_nodes;
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
-    // MPI 通信用（pinned host staging: GDR なし環境用）
-    double *h_send_buf_0, *h_send_buf_1, *h_send_buf_2;
-    double *h_recv_buf_0, *h_recv_buf_1, *h_recv_buf_2;
-    int total_send_nodes; // send buffer サイズ（double 要素数）
-    int num_ghost_nodes;  // recv buffer サイズ（double 要素数）
 
     // リダクション用
     double *d_reduce; // 小さいバッファ（3要素程度）
@@ -1399,7 +1394,7 @@ int pcg_solve(
         return 0;
 
     bool do_timing = (rank >= 0);
-    double t_d2h = 0, t_halo = 0, t_h2d = 0, t_spmv = 0;
+    double t_halo = 0, t_spmv = 0;
     double t_ar_pAp = 0, t_ar_rnorm = 0; // rnorm と rznew は統合 AllReduce
     double t_loop_total = 0;
     double _t0;
@@ -1424,25 +1419,17 @@ int pcg_solve(
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // GPU → pinned host へコピー
-        _t0 = MPI_Wtime();
-        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_0, dd.send_buffer_0, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_1, dd.send_buffer_1, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_2, dd.send_buffer_2, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
-        if (do_timing) t_d2h += MPI_Wtime() - _t0;
-
-        // pinned host buffer を使って送受信
+        // GPU-direct: デバイスポインタを直接送受信
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n];
             int sc = send_counts[n];
-            int ro = recv_starts[n] - recv_starts[0];
-            MPI_Isend(&dd.h_send_buf_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            MPI_Isend(&dd.h_send_buf_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
-            MPI_Isend(&dd.h_send_buf_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
-            MPI_Irecv(&dd.h_recv_buf_0[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
-            MPI_Irecv(&dd.h_recv_buf_1[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
-            MPI_Irecv(&dd.h_recv_buf_2[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
+            MPI_Isend(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+            MPI_Isend(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
+            MPI_Isend(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
+            MPI_Irecv(&dd.p_0[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
+            MPI_Irecv(&dd.p_1[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
+            MPI_Irecv(&dd.p_2[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
         }
 
         // --- 内側節点の SpMV（通信と並走）---
@@ -1468,13 +1455,6 @@ int pcg_solve(
         _t0 = MPI_Wtime();
         MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
         if (do_timing) t_halo += MPI_Wtime() - _t0;
-
-        // pinned host → GPU（受信ゴーストノード）
-        _t0 = MPI_Wtime();
-        CUDA_CHECK(cudaMemcpy(dd.p_0 + recv_starts[0], dd.h_recv_buf_0, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dd.p_1 + recv_starts[0], dd.h_recv_buf_1, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(dd.p_2 + recv_starts[0], dd.h_recv_buf_2, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
-        if (do_timing) t_h2d += MPI_Wtime() - _t0;
 
         // --- 外側節点の SpMV ---
         _t0 = MPI_Wtime();
@@ -1560,16 +1540,15 @@ int pcg_solve(
 
     if (do_timing)
     {
-        double local[] = {t_d2h, t_halo, t_h2d, t_spmv,
-                          t_ar_pAp, t_ar_rnorm, t_loop_total};
-        double maxv[7] = {};
-        MPI_Reduce(local, maxv, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        double local[] = {t_halo, t_spmv, t_ar_pAp, t_ar_rnorm, t_loop_total};
+        double maxv[5] = {};
+        MPI_Reduce(local, maxv, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         if (rank == 0)
         {
-            printf("  [timing %d iter] D2H=%.3fs HaloWait=%.3fs H2D=%.3fs SpMV=%.3fs "
+            printf("  [timing %d iter] HaloWait=%.3fs SpMV=%.3fs "
                    "AllReduce=%.3fs(pAp=%.3f rnorm+rznew=%.3f) total=%.3fs\n",
-                   iter, maxv[0], maxv[1], maxv[2], maxv[3],
-                   maxv[4] + maxv[5], maxv[4], maxv[5], maxv[6]);
+                   iter, maxv[0], maxv[1],
+                   maxv[2] + maxv[3], maxv[2], maxv[3], maxv[4]);
         }
     }
 
@@ -1727,9 +1706,12 @@ int main(int argc, char *argv[])
 
     int num_gpus;
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
-    printf("使用可能な最大GPU数：%d\n", num_gpus);
 
-    CUDA_CHECK(cudaSetDevice(rank % num_gpus));
+    // ローカルランク（ノード内での順位）でGPUを割り当てる
+    // ntasks-per-node が num_gpus 以下の任意の値でも正しく動作する
+    const char* local_rank_env = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    int local_rank = local_rank_env ? atoi(local_rank_env) : (rank % num_gpus);
+    CUDA_CHECK(cudaSetDevice(local_rank % num_gpus));
 
     double *node_coords = mesh.coords_ptr();
     int num_nodes = mesh.num_total;
@@ -1946,15 +1928,6 @@ int main(int argc, char *argv[])
     dd.send_buffer_0 = device_alloc_zero<double>(total_send);
     dd.send_buffer_1 = device_alloc_zero<double>(total_send);
     dd.send_buffer_2 = device_alloc_zero<double>(total_send);
-    // MPI通信用（pinned host staging）
-    dd.total_send_nodes = total_send;
-    dd.num_ghost_nodes  = num_ghost;
-    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_0, total_send * sizeof(double)));
-    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_1, total_send * sizeof(double)));
-    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_2, total_send * sizeof(double)));
-    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_0, num_ghost  * sizeof(double)));
-    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_1, num_ghost  * sizeof(double)));
-    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_2, num_ghost  * sizeof(double)));
 
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
@@ -2200,12 +2173,6 @@ int main(int argc, char *argv[])
     cudaFree(dd.send_buffer_0);
     cudaFree(dd.send_buffer_1);
     cudaFree(dd.send_buffer_2);
-    cudaFreeHost(dd.h_send_buf_0);
-    cudaFreeHost(dd.h_send_buf_1);
-    cudaFreeHost(dd.h_send_buf_2);
-    cudaFreeHost(dd.h_recv_buf_0);
-    cudaFreeHost(dd.h_recv_buf_1);
-    cudaFreeHost(dd.h_recv_buf_2);
     cudaFree(dd.d_reduce);
 
     // CPU メモリ解放

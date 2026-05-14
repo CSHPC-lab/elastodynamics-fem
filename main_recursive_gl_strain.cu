@@ -2141,7 +2141,7 @@ int pcg_solve(
             dd.p_0, dd.p_1, dd.p_2,
             dd.delta_u_0, dd.delta_u_1, dd.delta_u_2);
 
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 2 * sizeof(double)));
         kernel_update_r<<<grid_owned, BLOCK_SIZE>>>(
             num_owned, alpha,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
@@ -2151,28 +2151,8 @@ int pcg_solve(
         if (pt)
             pt->update_x_r += MPI_Wtime() - _t0;
 
-        CUDA_CHECK(cudaMemcpy(&r_norm, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
-        if (pt)
-        {
-            _t0 = MPI_Wtime();
-            MPI_Barrier(MPI_COMM_WORLD);
-            pt->barrier_rnorm += MPI_Wtime() - _t0;
-        }
+        // z = C^{-1}r, rz_new計算（収束前に実行し AllReduce を 1 回に統合）
         _t0 = MPI_Wtime();
-        MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (pt)
-            pt->allreduce_rnorm += MPI_Wtime() - _t0;
-
-        if (r_norm / b_norm < tol * tol)
-        {
-            iter++;
-            break;
-        }
-
-        // z = C^{-1}r, rz_new計算
-        _t0 = MPI_Wtime();
-        double rz_new = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
         kernel_precond_and_rz<<<grid_owned, BLOCK_SIZE>>>(
             num_owned,
             dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
@@ -2180,22 +2160,32 @@ int pcg_solve(
             dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22,
             dd.r_0, dd.r_1, dd.r_2,
             dd.z_0, dd.z_1, dd.z_2,
-            &dd.d_reduce[0]);
+            &dd.d_reduce[1]);
         CUDA_CHECK(cudaDeviceSynchronize());
         if (pt)
             pt->precond += MPI_Wtime() - _t0;
 
-        CUDA_CHECK(cudaMemcpy(&rz_new, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        // r_norm と rz_new を 1 回の AllReduce で取得
+        double h_rn_rz[2];
+        CUDA_CHECK(cudaMemcpy(h_rn_rz, dd.d_reduce, 2 * sizeof(double), cudaMemcpyDeviceToHost));
         if (pt)
         {
             _t0 = MPI_Wtime();
             MPI_Barrier(MPI_COMM_WORLD);
-            pt->barrier_rznew += MPI_Wtime() - _t0;
+            pt->barrier_rnorm += MPI_Wtime() - _t0;
         }
         _t0 = MPI_Wtime();
-        MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        MPI_Allreduce(MPI_IN_PLACE, h_rn_rz, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         if (pt)
-            pt->allreduce_rznew += MPI_Wtime() - _t0;
+            pt->allreduce_rnorm += MPI_Wtime() - _t0;
+        r_norm = h_rn_rz[0];
+        double rz_new = h_rn_rz[1];
+
+        if (r_norm / b_norm < tol * tol)
+        {
+            iter++;
+            break;
+        }
 
         double beta = rz_new / rz;
 
@@ -2383,7 +2373,9 @@ int main(int argc, char *argv[])
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
     printf("使用可能な最大GPU数：%d\n", num_gpus);
 
-    CUDA_CHECK(cudaSetDevice(rank % num_gpus));
+    const char *local_rank_env = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    int local_rank = local_rank_env ? atoi(local_rank_env) : (rank % num_gpus);
+    CUDA_CHECK(cudaSetDevice(local_rank % num_gpus));
 
     double *node_coords = mesh.coords_ptr();
     int num_nodes = mesh.num_total;

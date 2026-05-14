@@ -1,7 +1,7 @@
 # Simulation parameters
-duration        40.0
-num_steps       8000
-sample_freq     2
+duration        100.0
+num_steps       320000
+sample_freq     32
 
 # Material properties
 c1              200
@@ -15,7 +15,7 @@ force_dof       2
 force_magnitude 0.0
 
 # Boundary displacement
-disp_amp  0.05
+disp_amp  0.5
 
 # Stiffness matrix
 ratio           1.0
@@ -25,3 +25,4 @@ mass            second
 
 # Output
 write_vtk       false
+timing          true

@@ -1791,7 +1791,8 @@ int pcg_solve(
             dd.delta_u_0, dd.delta_u_1, dd.delta_u_2);
 
         // r -= alpha * Ap, r_norm計算
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
+        // r_norm と rz_new を 1 回の AllReduce で取得
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 2 * sizeof(double)));
         kernel_update_r<<<grid_owned, BLOCK_SIZE>>>(
             num_owned, alpha,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
@@ -1799,18 +1800,6 @@ int pcg_solve(
             &dd.d_reduce[0]);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        CUDA_CHECK(cudaMemcpy(&r_norm, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
-        MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-
-        if (r_norm / b_norm < tol * tol)
-        {
-            iter++;
-            break;
-        }
-
-        // z = C^{-1}r, rz_new計算
-        double rz_new = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
         kernel_precond_and_rz<<<grid_owned, BLOCK_SIZE>>>(
             num_owned,
             dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
@@ -1818,11 +1807,21 @@ int pcg_solve(
             dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22,
             dd.r_0, dd.r_1, dd.r_2,
             dd.z_0, dd.z_1, dd.z_2,
-            &dd.d_reduce[0]);
+            &dd.d_reduce[1]);
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        CUDA_CHECK(cudaMemcpy(&rz_new, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
-        MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        double h_rn_rz[2];
+        CUDA_CHECK(cudaMemcpy(h_rn_rz, dd.d_reduce, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+        MPI_Allreduce(MPI_IN_PLACE, h_rn_rz, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        r_norm = h_rn_rz[0];
+        double rz_new = h_rn_rz[1];
+
+        if (r_norm / b_norm < tol * tol)
+        {
+            iter++;
+            break;
+        }
+
 
         double beta = rz_new / rz;
 
@@ -1937,7 +1936,9 @@ int main(int argc, char *argv[])
     CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
     printf("使用可能な最大GPU数：%d\n", num_gpus);
 
-    CUDA_CHECK(cudaSetDevice(rank % num_gpus));
+    const char* local_rank_env = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    int local_rank = local_rank_env ? atoi(local_rank_env) : (rank % num_gpus);
+    CUDA_CHECK(cudaSetDevice(local_rank % num_gpus));
 
     double *node_coords = mesh.coords_ptr();
     int num_nodes = mesh.num_total;

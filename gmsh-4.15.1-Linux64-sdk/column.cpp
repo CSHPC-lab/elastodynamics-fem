@@ -21,8 +21,8 @@ static std::size_t count_mesh_nodes()
 
 int main(int argc, char **argv)
 {
-    const double mesh_size = 2.0; // メッシュサイズの目安
-    int parallel_parts = 1; // パーティション数（MPI並列数に合わせる）
+    const double mesh_size = 0.25; // メッシュサイズの目安
+    int parallel_parts = 16;       // パーティション数（MPI並列数に合わせる）
     if (argc >= 2)
         parallel_parts = std::atoi(argv[1]);
     if (parallel_parts < 1)
@@ -49,9 +49,16 @@ int main(int argc, char **argv)
     // メッシュサイズの設定
     gmsh::option::setNumber("Mesh.CharacteristicLengthMax", mesh_size);
 
-    // 3Dメッシュ生成の並列化（HXTアルゴリズムが必要）
-    gmsh::option::setNumber("Mesh.Algorithm3D", 10);     // HXT
-    gmsh::option::setNumber("Mesh.MaxNumThreads3D", 24); // スレッド数（コア数に合わせる）
+    // HXTの並列Delaunayは実行ごとに点挿入順が揺れ、節点数まで変わり得る。
+    // 強スケーリング比較では同一メッシュが必須なので、デフォルトは1スレッドに固定する。
+    int mesh_threads = 1;
+    if (const char *env_threads = std::getenv("GMSH_MESH_THREADS"))
+        mesh_threads = std::max(1, std::atoi(env_threads));
+    gmsh::option::setNumber("General.NumThreads", mesh_threads);
+    gmsh::option::setNumber("Mesh.MaxNumThreads1D", mesh_threads);
+    gmsh::option::setNumber("Mesh.MaxNumThreads2D", mesh_threads);
+    gmsh::option::setNumber("Mesh.MaxNumThreads3D", mesh_threads);
+    gmsh::option::setNumber("Mesh.Algorithm3D", 10); // HXT
 
     // 3Dメッシュ生成
     gmsh::model::mesh::generate(3);
