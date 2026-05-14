@@ -4,6 +4,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <cctype>
 
 struct Config
 {
@@ -35,7 +36,13 @@ struct Config
     double get_double(const std::string &key) const { return std::stod(data.at(key)); }
     int get_int(const std::string &key) const { return std::stoi(data.at(key)); }
     std::string get_string(const std::string &key) const { return data.at(key); }
-    bool get_bool(const std::string &key) const { return data.at(key) == "true"; }
+    bool get_bool(const std::string &key) const
+    {
+        std::string v = data.at(key);
+        for (char &c : v)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return v == "true" || v == "1" || v == "yes" || v == "on";
+    }
 
     bool has(const std::string &key) const { return data.count(key) > 0; }
 };

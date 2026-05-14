@@ -1962,6 +1962,9 @@ struct PcgTimings
     double allreduce_pAp = 0.0;   // MPI_Allreduce(pAp)
     double allreduce_rnorm = 0.0; // MPI_Allreduce(r_norm)
     double allreduce_rznew = 0.0; // MPI_Allreduce(rz_new)
+    double barrier_pAp = 0.0;     // MPI_Allreduce(pAp) 直前の到着待ち診断
+    double barrier_rnorm = 0.0;   // MPI_Allreduce(r_norm) 直前の到着待ち診断
+    double barrier_rznew = 0.0;   // MPI_Allreduce(rz_new) 直前の到着待ち診断
     double halo_wait = 0.0;       // MPI_Waitall (ハロー交換)
     double spmv_inner = 0.0;      // 内側節点 SpMV + dot
     double spmv_bdr = 0.0;        // 境界節点 SpMV + dot
@@ -2118,6 +2121,12 @@ int pcg_solve(
             pt->spmv_bdr += MPI_Wtime() - _t0;
 
         CUDA_CHECK(cudaMemcpy(&h_pAp, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        if (pt)
+        {
+            _t0 = MPI_Wtime();
+            MPI_Barrier(MPI_COMM_WORLD);
+            pt->barrier_pAp += MPI_Wtime() - _t0;
+        }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         if (pt)
@@ -2143,6 +2152,12 @@ int pcg_solve(
             pt->update_x_r += MPI_Wtime() - _t0;
 
         CUDA_CHECK(cudaMemcpy(&r_norm, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        if (pt)
+        {
+            _t0 = MPI_Wtime();
+            MPI_Barrier(MPI_COMM_WORLD);
+            pt->barrier_rnorm += MPI_Wtime() - _t0;
+        }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         if (pt)
@@ -2171,6 +2186,12 @@ int pcg_solve(
             pt->precond += MPI_Wtime() - _t0;
 
         CUDA_CHECK(cudaMemcpy(&rz_new, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        if (pt)
+        {
+            _t0 = MPI_Wtime();
+            MPI_Barrier(MPI_COMM_WORLD);
+            pt->barrier_rznew += MPI_Wtime() - _t0;
+        }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         if (pt)
@@ -2301,6 +2322,11 @@ int main(int argc, char *argv[])
     MPI_Comm_size(MPI_COMM_WORLD, &size);
     MPI_Request requests[1000];
 
+    Config cfg;
+    cfg.load("config.txt");
+    // timing true で時間計測ログを出力（デフォルト: false）
+    bool do_timing = cfg.has("timing") && cfg.get_bool("timing");
+
     double start_time = MPI_Wtime();
 
     FEMMesh mesh = read_msh("column_4.msh", rank + 1);
@@ -2308,9 +2334,6 @@ int main(int argc, char *argv[])
 
     double mesh_time = MPI_Wtime() - start_time;
     std::cout << "Mesh reading time: " << mesh_time << " seconds" << std::endl;
-
-    Config cfg;
-    cfg.load("config.txt");
 
     double duration = cfg.get_double("duration");
     int num_steps = cfg.get_int("num_steps");
@@ -2339,8 +2362,6 @@ int main(int argc, char *argv[])
             mass_version = MassVersion::SECOND;
     }
     bool write_vtk = cfg.get_bool("write_vtk");
-    // timing true で PCG 内訳の詳細タイミングを出力（デフォルト: false）
-    bool do_timing = cfg.has("timing") && cfg.get_bool("timing");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
     if (rank == 0)
@@ -2887,17 +2908,23 @@ int main(int argc, char *argv[])
             {
                 const double allreduce_total_local =
                     pcg_t.allreduce_pAp + pcg_t.allreduce_rnorm + pcg_t.allreduce_rznew;
+                const double barrier_total_local =
+                    pcg_t.barrier_pAp + pcg_t.barrier_rnorm + pcg_t.barrier_rznew;
                 double timing_local[] = {
                     pcg_t.pack_buf,
                     pcg_t.spmv_inner,
                     pcg_t.halo_wait,
                     pcg_t.spmv_bdr,
                     pcg_t.allreduce_pAp,
+                    pcg_t.barrier_pAp,
                     pcg_t.update_x_r,
                     pcg_t.allreduce_rnorm,
+                    pcg_t.barrier_rnorm,
                     pcg_t.precond,
                     pcg_t.allreduce_rznew,
+                    pcg_t.barrier_rznew,
                     allreduce_total_local,
+                    barrier_total_local,
                     t_fint_local,
                     inner_loop_time};
                 double timing_max[sizeof(timing_local) / sizeof(timing_local[0])] = {};
@@ -2908,15 +2935,17 @@ int main(int argc, char *argv[])
                 {
                     printf("  [timing rank-max] PCG内訳(%d反復): "
                            "AllReduce合計=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) "
+                           "Barrier直前合計=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) "
                            "HaloWait=%.3fs Pack=%.3fs SpMV(inner+bdr)=%.3fs(%.3f+%.3f) "
                            "前処理=%.3fs GPU更新=%.3fs\n",
                            iter,
-                           timing_max[9], timing_max[4], timing_max[6], timing_max[8],
+                           timing_max[12], timing_max[4], timing_max[7], timing_max[10],
+                           timing_max[13], timing_max[5], timing_max[8], timing_max[11],
                            timing_max[2], timing_max[0],
                            timing_max[1] + timing_max[3], timing_max[1], timing_max[3],
-                           timing_max[7], timing_max[5]);
+                           timing_max[9], timing_max[6]);
                     printf("  [timing rank-max] PCG外: f_int_local=%.3fs 内側ループ合計=%.3fs\n",
-                           timing_max[10], timing_max[11]);
+                           timing_max[14], timing_max[15]);
                 }
             }
             if (rank == 0)
