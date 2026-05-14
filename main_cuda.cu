@@ -92,9 +92,14 @@ struct DeviceData
     // 境界条件の値
     double *bc_val_u, *bc_val_v, *bc_val_a;
 
-    // MPI 通信用
+    // MPI 通信用（GPU バッファ）
     int *send_nodes;
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
+    // MPI 通信用（pinned host staging: GDR なし環境用）
+    double *h_send_buf_0, *h_send_buf_1, *h_send_buf_2;
+    double *h_recv_buf_0, *h_recv_buf_1, *h_recv_buf_2;
+    int total_send_nodes; // send buffer サイズ（double 要素数）
+    int num_ghost_nodes;  // recv buffer サイズ（double 要素数）
 
     // リダクション用
     double *d_reduce; // 小さいバッファ（3要素程度）
@@ -1412,20 +1417,26 @@ int pcg_solve(
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // GPU-aware MPI: デバイスポインタを直接送受信
+        // GPU → pinned host へコピー（GDR なし環境: UCX に GPU ptr を渡さない）
+        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_0, dd.send_buffer_0, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_1, dd.send_buffer_1, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(dd.h_send_buf_2, dd.send_buffer_2, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+
+        // pinned host buffer を使って送受信（UCX が GPU sync を挿入しない）
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n];
             int sc = send_counts[n];
-            MPI_Isend(&dd.send_buffer_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
-            MPI_Isend(&dd.send_buffer_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
-            MPI_Isend(&dd.send_buffer_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_0[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_1[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
-            MPI_Irecv(&dd.p_2[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
+            int ro = recv_starts[n] - recv_starts[0]; // h_recv_buf 内オフセット
+            MPI_Isend(&dd.h_send_buf_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
+            MPI_Isend(&dd.h_send_buf_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
+            MPI_Isend(&dd.h_send_buf_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
+            MPI_Irecv(&dd.h_recv_buf_0[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[3 * num_neighbors + n]);
+            MPI_Irecv(&dd.h_recv_buf_1[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[4 * num_neighbors + n]);
+            MPI_Irecv(&dd.h_recv_buf_2[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
         }
 
-        // --- 内側節点の SpMV + pAp ---
+        // --- 内側節点の SpMV + pAp（通信と並走）---
         double h_pAp = 0.0;
         CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
 
@@ -1443,8 +1454,11 @@ int pcg_solve(
             CUDA_CHECK(cudaDeviceSynchronize());
         }
 
-        // ゴースト節点の通信完了を待つ
+        // 通信完了待ち → pinned host から GPU へコピー
         MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
+        CUDA_CHECK(cudaMemcpy(dd.p_0 + recv_starts[0], dd.h_recv_buf_0, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dd.p_1 + recv_starts[0], dd.h_recv_buf_1, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dd.p_2 + recv_starts[0], dd.h_recv_buf_2, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
 
         // --- 外側節点の SpMV + pAp ---
         int num_bdr = num_owned - num_inner;
@@ -1891,11 +1905,20 @@ int main(int argc, char *argv[])
     dd.bc_val_v = device_alloc_zero<double>(3);
     dd.bc_val_a = device_alloc_zero<double>(3);
 
-    // MPI通信用
+    // MPI通信用（GPU）
     dd.send_nodes = device_alloc_copy(send_nodes_ptr, total_send);
     dd.send_buffer_0 = device_alloc_zero<double>(total_send);
     dd.send_buffer_1 = device_alloc_zero<double>(total_send);
     dd.send_buffer_2 = device_alloc_zero<double>(total_send);
+    // MPI通信用（pinned host staging）
+    dd.total_send_nodes = total_send;
+    dd.num_ghost_nodes  = num_ghost;
+    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_0, total_send * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_1, total_send * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost(&dd.h_send_buf_2, total_send * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_0, num_ghost  * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_1, num_ghost  * sizeof(double)));
+    CUDA_CHECK(cudaMallocHost(&dd.h_recv_buf_2, num_ghost  * sizeof(double)));
 
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
@@ -2139,6 +2162,12 @@ int main(int argc, char *argv[])
     cudaFree(dd.send_buffer_0);
     cudaFree(dd.send_buffer_1);
     cudaFree(dd.send_buffer_2);
+    cudaFreeHost(dd.h_send_buf_0);
+    cudaFreeHost(dd.h_send_buf_1);
+    cudaFreeHost(dd.h_send_buf_2);
+    cudaFreeHost(dd.h_recv_buf_0);
+    cudaFreeHost(dd.h_recv_buf_1);
+    cudaFreeHost(dd.h_recv_buf_2);
     cudaFree(dd.d_reduce);
 
     // CPU メモリ解放
