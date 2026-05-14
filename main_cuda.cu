@@ -1356,7 +1356,8 @@ int pcg_solve(
     int num_owned,
     int num_nodes,
     double tol,
-    int max_iter)
+    int max_iter,
+    int rank = -1) // rank >= 0 のとき詳細タイミングを出力
 {
     int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -1397,8 +1398,14 @@ int pcg_solve(
     if (r_norm / b_norm < tol * tol)
         return 0;
 
+    bool do_timing = (rank >= 0);
+    double t_d2h = 0, t_halo = 0, t_h2d = 0, t_spmv = 0;
+    double t_ar_pAp = 0, t_ar_rnorm = 0, t_ar_rznew = 0;
+    double t_loop_total = 0;
+    double _t0;
+
     int iter;
-    double iter_start_time = MPI_Wtime();
+    double loop_start = MPI_Wtime();
     for (iter = 0; iter < max_iter; iter++)
     {
         // --- ゴースト節点の通信 ---
@@ -1417,17 +1424,19 @@ int pcg_solve(
         }
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // GPU → pinned host へコピー（GDR なし環境: UCX に GPU ptr を渡さない）
+        // GPU → pinned host へコピー
+        _t0 = MPI_Wtime();
         CUDA_CHECK(cudaMemcpy(dd.h_send_buf_0, dd.send_buffer_0, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(dd.h_send_buf_1, dd.send_buffer_1, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(dd.h_send_buf_2, dd.send_buffer_2, dd.total_send_nodes * sizeof(double), cudaMemcpyDeviceToHost));
+        if (do_timing) t_d2h += MPI_Wtime() - _t0;
 
-        // pinned host buffer を使って送受信（UCX が GPU sync を挿入しない）
+        // pinned host buffer を使って送受信
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n];
             int sc = send_counts[n];
-            int ro = recv_starts[n] - recv_starts[0]; // h_recv_buf 内オフセット
+            int ro = recv_starts[n] - recv_starts[0];
             MPI_Isend(&dd.h_send_buf_0[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 0, MPI_COMM_WORLD, &request[n]);
             MPI_Isend(&dd.h_send_buf_1[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 1, MPI_COMM_WORLD, &request[num_neighbors + n]);
             MPI_Isend(&dd.h_send_buf_2[ss], sc, MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[2 * num_neighbors + n]);
@@ -1436,10 +1445,10 @@ int pcg_solve(
             MPI_Irecv(&dd.h_recv_buf_2[ro], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
         }
 
-        // --- 内側節点の SpMV + pAp（通信と並走）---
+        // --- 内側節点の SpMV（通信と並走）---
         double h_pAp = 0.0;
         CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
-
+        _t0 = MPI_Wtime();
         if (num_inner > 0)
         {
             int grid_inner = (num_inner + BLOCK_SIZE - 1) * 32 / BLOCK_SIZE;
@@ -1453,14 +1462,22 @@ int pcg_solve(
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        if (do_timing) t_spmv += MPI_Wtime() - _t0;
 
-        // 通信完了待ち → pinned host から GPU へコピー
+        // 通信完了待ち
+        _t0 = MPI_Wtime();
         MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
+        if (do_timing) t_halo += MPI_Wtime() - _t0;
+
+        // pinned host → GPU（受信ゴーストノード）
+        _t0 = MPI_Wtime();
         CUDA_CHECK(cudaMemcpy(dd.p_0 + recv_starts[0], dd.h_recv_buf_0, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.p_1 + recv_starts[0], dd.h_recv_buf_1, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.p_2 + recv_starts[0], dd.h_recv_buf_2, dd.num_ghost_nodes * sizeof(double), cudaMemcpyHostToDevice));
+        if (do_timing) t_h2d += MPI_Wtime() - _t0;
 
-        // --- 外側節点の SpMV + pAp ---
+        // --- 外側節点の SpMV ---
+        _t0 = MPI_Wtime();
         int num_bdr = num_owned - num_inner;
         if (num_bdr > 0)
         {
@@ -1475,15 +1492,18 @@ int pcg_solve(
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
-
         kernel_dot3_reduce<<<grid_owned, BLOCK_SIZE>>>(
             0, num_owned,
             dd.p_0, dd.p_1, dd.p_2,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
             &dd.d_reduce[0]);
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (do_timing) t_spmv += MPI_Wtime() - _t0;
+
         CUDA_CHECK(cudaMemcpy(&h_pAp, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (do_timing) t_ar_pAp += MPI_Wtime() - _t0;
 
         double alpha = rz / h_pAp;
 
@@ -1503,7 +1523,9 @@ int pcg_solve(
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(&r_norm, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (do_timing) t_ar_rnorm += MPI_Wtime() - _t0;
 
         if (r_norm / b_norm < tol * tol)
         {
@@ -1525,7 +1547,9 @@ int pcg_solve(
         CUDA_CHECK(cudaDeviceSynchronize());
 
         CUDA_CHECK(cudaMemcpy(&rz_new, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (do_timing) t_ar_rznew += MPI_Wtime() - _t0;
 
         double beta = rz_new / rz;
 
@@ -1535,6 +1559,22 @@ int pcg_solve(
             dd.p_0, dd.p_1, dd.p_2);
 
         rz = rz_new;
+    }
+    t_loop_total = MPI_Wtime() - loop_start;
+
+    if (do_timing)
+    {
+        double local[] = {t_d2h, t_halo, t_h2d, t_spmv,
+                          t_ar_pAp, t_ar_rnorm, t_ar_rznew, t_loop_total};
+        double maxv[8] = {};
+        MPI_Reduce(local, maxv, 8, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        if (rank == 0)
+        {
+            printf("  [timing %d iter] D2H=%.3fs HaloWait=%.3fs H2D=%.3fs SpMV=%.3fs "
+                   "AllReduce=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) total=%.3fs\n",
+                   iter, maxv[0], maxv[1], maxv[2], maxv[3],
+                   maxv[4] + maxv[5] + maxv[6], maxv[4], maxv[5], maxv[6], maxv[7]);
+        }
     }
 
     return iter;
@@ -2018,10 +2058,12 @@ int main(int argc, char *argv[])
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // PCGソルバー
+        // PCGソルバー（step 2 のみ詳細タイミング出力）
+        bool print_timing = (step == 2);
         int iter = pcg_solve(dd, requests, num_neighbors, neighbor_ranks,
                              recv_starts, recv_counts, send_starts, send_counts,
-                             num_inner, num_owned, num_nodes, 1e-8, num_nodes * 3);
+                             num_inner, num_owned, num_nodes, 1e-8, num_nodes * 3,
+                             print_timing ? rank : -1);
 
         if (rank == 0)
         {
