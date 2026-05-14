@@ -1400,7 +1400,7 @@ int pcg_solve(
 
     bool do_timing = (rank >= 0);
     double t_d2h = 0, t_halo = 0, t_h2d = 0, t_spmv = 0;
-    double t_ar_pAp = 0, t_ar_rnorm = 0, t_ar_rznew = 0;
+    double t_ar_pAp = 0, t_ar_rnorm = 0; // rnorm と rznew は統合 AllReduce
     double t_loop_total = 0;
     double _t0;
 
@@ -1513,29 +1513,16 @@ int pcg_solve(
             dd.p_0, dd.p_1, dd.p_2,
             dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
 
-        // r -= alpha * Ap, r_norm計算
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
+        // r -= alpha * Ap, r_norm計算 + z = C^{-1}r, rz_new計算
+        // rnorm と rznew の AllReduce を1回に統合（収束前に rz_new も計算）
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 2 * sizeof(double)));
         kernel_update_r<<<grid_owned, BLOCK_SIZE>>>(
             num_owned, alpha,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
             dd.r_0, dd.r_1, dd.r_2,
-            &dd.d_reduce[0]);
+            &dd.d_reduce[0]);   // d_reduce[0] に r_norm を蓄積
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        CUDA_CHECK(cudaMemcpy(&r_norm, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
-        _t0 = MPI_Wtime();
-        MPI_Allreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (do_timing) t_ar_rnorm += MPI_Wtime() - _t0;
-
-        if (r_norm / b_norm < tol * tol)
-        {
-            iter++;
-            break;
-        }
-
-        // z = C^{-1}r, rz_new計算
-        double rz_new = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
         kernel_precond_and_rz<<<grid_owned, BLOCK_SIZE>>>(
             num_owned,
             dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
@@ -1543,13 +1530,22 @@ int pcg_solve(
             dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22,
             dd.r_0, dd.r_1, dd.r_2,
             dd.z_0, dd.z_1, dd.z_2,
-            &dd.d_reduce[0]);
+            &dd.d_reduce[1]);   // d_reduce[1] に rz_new を蓄積
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        CUDA_CHECK(cudaMemcpy(&rz_new, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        double h_rn_rz[2];
+        CUDA_CHECK(cudaMemcpy(h_rn_rz, dd.d_reduce, 2 * sizeof(double), cudaMemcpyDeviceToHost));
         _t0 = MPI_Wtime();
-        MPI_Allreduce(MPI_IN_PLACE, &rz_new, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (do_timing) t_ar_rznew += MPI_Wtime() - _t0;
+        MPI_Allreduce(MPI_IN_PLACE, h_rn_rz, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (do_timing) t_ar_rnorm += MPI_Wtime() - _t0;
+        r_norm = h_rn_rz[0];
+        double rz_new = h_rn_rz[1];
+
+        if (r_norm / b_norm < tol * tol)
+        {
+            iter++;
+            break;
+        }
 
         double beta = rz_new / rz;
 
@@ -1565,15 +1561,15 @@ int pcg_solve(
     if (do_timing)
     {
         double local[] = {t_d2h, t_halo, t_h2d, t_spmv,
-                          t_ar_pAp, t_ar_rnorm, t_ar_rznew, t_loop_total};
-        double maxv[8] = {};
-        MPI_Reduce(local, maxv, 8, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+                          t_ar_pAp, t_ar_rnorm, t_loop_total};
+        double maxv[7] = {};
+        MPI_Reduce(local, maxv, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         if (rank == 0)
         {
             printf("  [timing %d iter] D2H=%.3fs HaloWait=%.3fs H2D=%.3fs SpMV=%.3fs "
-                   "AllReduce=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) total=%.3fs\n",
+                   "AllReduce=%.3fs(pAp=%.3f rnorm+rznew=%.3f) total=%.3fs\n",
                    iter, maxv[0], maxv[1], maxv[2], maxv[3],
-                   maxv[4] + maxv[5] + maxv[6], maxv[4], maxv[5], maxv[6], maxv[7]);
+                   maxv[4] + maxv[5], maxv[4], maxv[5], maxv[6]);
         }
     }
 
