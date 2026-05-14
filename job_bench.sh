@@ -12,7 +12,7 @@
 . /etc/profile.d/modules.sh
 module load nvhpc/25.1
 
-export UCX_TLS=rc,rc_mlx5,shm,self
+export UCX_TLS=rc,rc_mlx5,self
 export UCX_WARN_UNUSED_ENV_VARS=n
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 

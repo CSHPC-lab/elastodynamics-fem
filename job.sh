@@ -22,7 +22,7 @@ export OMP_WAIT_POLICY=active
 
 # GDR (gdr_copy) 非対応環境: MPI に GPU ptr を渡さず pinned host staging を使う
 # → UCX の暗黙 GPU sync を全 MPI コレクティブ前に抑止する
-export UCX_TLS=rc,rc_mlx5,shm,self
+export UCX_TLS=rc,rc_mlx5,self
 export UCX_WARN_UNUSED_ENV_VARS=n
 
 # mpirun -n $SLURM_NTASKS --map-by numa --bind-to numa ./a.out
