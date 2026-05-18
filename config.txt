@@ -1,7 +1,7 @@
 # Simulation parameters
-duration        100.0
-num_steps       40000
-sample_freq     4
+duration        700.0
+num_steps       5600
+sample_freq     8
 
 # Material properties
 c1              200
@@ -16,7 +16,7 @@ bc_face_axis    2        # 拘束面の法線軸 (0=x / 1=y / 2=z)
 bc_face_coord   0.0      # その軸の座標がこれ以下の節点を拘束
 bc_dof          1        # 変位入力の方向 (0/1/2)
 bc_waveform     sin      # sin / ricker / step / linear / file
-bc_amp          0.5      # [sin/ricker/step] 振幅 [m]
+bc_amp          0.0      # [sin/ricker/step] 振幅 [m]
 bc_omega        1.0      # [sin/ricker] 角周波数 [rad/s]
 bc_cycles       1.0      # [sin] このサイクル数を超えたらゼロ
 # bc_start      0.0      # [linear] t=0 の値 [m]
@@ -24,14 +24,14 @@ bc_cycles       1.0      # [sin] このサイクル数を超えたらゼロ
 # bc_waveform_file bc_input.txt  # [file] 時系列ファイル (t value の2列)
 
 # External point force
-force_node      1
+force_node      2
 force_dof       2
-force_waveform  step     # sin / ricker / step / linear / file
-force_amp       0.0      # [sin/ricker/step] 振幅 [N]
-force_omega     1.0      # [sin/ricker] 角周波数 [rad/s]
-force_cycles    1.0      # [sin] このサイクル数を超えたらゼロ
-# force_start   0.0      # [linear] t=0 の値 [N]
-# force_end     1000.0   # [linear] t=duration の値 [N]
+force_waveform  linear     # sin / ricker / step / linear / file
+# force_amp       0.0      # [sin/ricker/step] 振幅 [N]
+# force_omega     1.0      # [sin/ricker] 角周波数 [rad/s]
+# force_cycles    1.0      # [sin] このサイクル数を超えたらゼロ
+force_start   0.0      # [linear] t=0 の値 [N]
+force_end     -20000000.0   # [linear] t=duration の値 [N]
 # force_waveform_file force_input.txt  # [file] 時系列ファイル (t value の2列)
 
 # Mass matrix: consistent / lumped / second

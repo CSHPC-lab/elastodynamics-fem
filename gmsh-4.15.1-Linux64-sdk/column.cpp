@@ -21,8 +21,8 @@ static std::size_t count_mesh_nodes()
 
 int main(int argc, char **argv)
 {
-    const double mesh_size = 0.25; // メッシュサイズの目安
-    int parallel_parts = 16;       // パーティション数（MPI並列数に合わせる）
+    const double mesh_size = 2.0; // メッシュサイズの目安
+    int parallel_parts = 1;       // パーティション数（MPI並列数に合わせる）
     if (argc >= 2)
         parallel_parts = std::atoi(argv[1]);
     if (parallel_parts < 1)
@@ -37,11 +37,13 @@ int main(int argc, char **argv)
 
     // 固定したい節点を追加
     int ptTag = gmsh::model::occ::addPoint(5, 5, 50);
+    int ptTag2 = gmsh::model::occ::addPoint(5, 5, 100);
 
     // ボリュームと点の交差を取り、正しいトポロジー関係を構築する
     std::vector<std::pair<int, int>> outDimTags;
     std::vector<std::vector<std::pair<int, int>>> outDimTagsMap;
-    gmsh::model::occ::fragment({{3, volTag}}, {{0, ptTag}}, outDimTags, outDimTagsMap);
+    // gmsh::model::occ::fragment({{3, volTag}}, {{0, ptTag}}, outDimTags, outDimTagsMap);
+    gmsh::model::occ::fragment({{3, volTag}}, {{0, ptTag}, {0, ptTag2}}, outDimTags, outDimTagsMap);
 
     // fragment 演算の後に synchronize を実行
     gmsh::model::occ::synchronize();
