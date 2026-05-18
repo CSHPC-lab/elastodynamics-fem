@@ -1,9 +1,9 @@
 #!/bin/bash -l
 
-#SBATCH --nodes=4
-#SBATCH --partition=40g
-#SBATCH --ntasks-per-node=4
-#SBATCH --gpus-per-node=4
+#SBATCH --nodes=1
+#SBATCH --partition=all
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=12
 #SBATCH --gpus-per-task=1
 #SBATCH --time=120:00:00

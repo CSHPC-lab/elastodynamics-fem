@@ -1,13 +1,15 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_cuda.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
+nvcc -O2 -arch=sm_80 -Xcompiler -fopenmp -ccbin mpicxx main_cuda.cu msh_reader.cpp
+nsight computeのコードベース解析には-lineinfoオプションを使う
 sm_80はA100向け。H100、GH200ならsm_90。
 mpirun -np 4 ./a.out
 */
 
 #include "msh_reader.hpp"
 #include "config.hpp"
+#include "waveform.hpp"
 #include <iostream>
 #include <cmath>
 #include <ctime>
@@ -1338,6 +1340,23 @@ void build_bcrs(
         thrust::device_pointer_cast(bcrs_row_ptr + 1));
 }
 
+// PCG 各操作の累積時間（細粒度ボトルネック調査用）
+struct PcgTimings
+{
+    double allreduce_pAp = 0.0;   // MPI_Allreduce(pAp)
+    double allreduce_rnorm = 0.0; // MPI_Allreduce(r_norm)
+    double allreduce_rznew = 0.0; // MPI_Allreduce(rz_new)
+    double barrier_pAp = 0.0;     // MPI_Allreduce(pAp) 直前の到着待ち診断
+    double barrier_rnorm = 0.0;   // MPI_Allreduce(r_norm) 直前の到着待ち診断
+    double barrier_rznew = 0.0;   // MPI_Allreduce(rz_new) 直前の到着待ち診断
+    double halo_wait = 0.0;       // MPI_Waitall (ハロー交換)
+    double spmv_inner = 0.0;      // 内側節点 SpMV + dot
+    double spmv_bdr = 0.0;        // 境界節点 SpMV + dot
+    double pack_buf = 0.0;        // send buffer パック
+    double update_x_r = 0.0;      // x+=alpha*p, r-=alpha*Ap (GPU)
+    double precond = 0.0;         // 前処理 z=C^{-1}r (GPU)
+};
+
 int pcg_solve(
     DeviceData &dd,
     MPI_Request *request,
@@ -1352,7 +1371,7 @@ int pcg_solve(
     int num_nodes,
     double tol,
     int max_iter,
-    int rank = -1) // rank >= 0 のとき詳細タイミングを出力
+    PcgTimings *pt = nullptr)
 {
     int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -1388,22 +1407,18 @@ int pcg_solve(
     MPI_Iallreduce(MPI_IN_PLACE, &r_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD, &request[2]);
     MPI_Waitall(3, request, MPI_STATUSES_IGNORE);
 
-    if (b_norm == 0.0)
-        b_norm = 1.0;
+    if (b_norm < 1e-16)
+        return 0;
     if (r_norm / b_norm < tol * tol)
         return 0;
 
-    bool do_timing = (rank >= 0);
-    double t_halo = 0, t_spmv = 0;
-    double t_ar_pAp = 0, t_ar_rnorm = 0; // rnorm と rznew は統合 AllReduce
-    double t_loop_total = 0;
     double _t0;
 
     int iter;
-    double loop_start = MPI_Wtime();
     for (iter = 0; iter < max_iter; iter++)
     {
         // --- ゴースト節点の通信 ---
+        _t0 = MPI_Wtime();
         for (int n = 0; n < num_neighbors; n++)
         {
             int ss = send_starts[n];
@@ -1418,6 +1433,8 @@ int pcg_solve(
             }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (pt)
+            pt->pack_buf += MPI_Wtime() - _t0;
 
         // GPU-direct: デバイスポインタを直接送受信
         for (int n = 0; n < num_neighbors; n++)
@@ -1432,9 +1449,10 @@ int pcg_solve(
             MPI_Irecv(&dd.p_2[recv_starts[n]], recv_counts[n], MPI_DOUBLE, neighbor_ranks[n], 2, MPI_COMM_WORLD, &request[5 * num_neighbors + n]);
         }
 
-        // --- 内側節点の SpMV（通信と並走）---
+        // --- 内側節点の SpMV + pAp (ハロー交換と並走) ---
         double h_pAp = 0.0;
-        CUDA_CHECK(cudaMemset(dd.d_reduce, 0, sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.d_reduce, 0.0, sizeof(double)));
+
         _t0 = MPI_Wtime();
         if (num_inner > 0)
         {
@@ -1448,15 +1466,23 @@ int pcg_solve(
                 dd.p_0, dd.p_1, dd.p_2,
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
             CUDA_CHECK(cudaDeviceSynchronize());
+            kernel_dot3_reduce<<<grid_inner, BLOCK_SIZE>>>(
+                0, num_inner,
+                dd.p_0, dd.p_1, dd.p_2,
+                dd.Ap_0, dd.Ap_1, dd.Ap_2,
+                &dd.d_reduce[0]);
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
-        if (do_timing) t_spmv += MPI_Wtime() - _t0;
+        if (pt)
+            pt->spmv_inner += MPI_Wtime() - _t0;
 
-        // 通信完了待ち
+        // ゴースト節点の通信完了を待つ
         _t0 = MPI_Wtime();
         MPI_Waitall(6 * num_neighbors, request, MPI_STATUSES_IGNORE);
-        if (do_timing) t_halo += MPI_Wtime() - _t0;
+        if (pt)
+            pt->halo_wait += MPI_Wtime() - _t0;
 
-        // --- 外側節点の SpMV ---
+        // --- 外側節点の SpMV + pAp ---
         _t0 = MPI_Wtime();
         int num_bdr = num_owned - num_inner;
         if (num_bdr > 0)
@@ -1471,38 +1497,49 @@ int pcg_solve(
                 dd.p_0, dd.p_1, dd.p_2,
                 dd.Ap_0, dd.Ap_1, dd.Ap_2);
             CUDA_CHECK(cudaDeviceSynchronize());
+            kernel_dot3_reduce<<<grid_bdr, BLOCK_SIZE>>>(
+                num_inner, num_owned,
+                dd.p_0, dd.p_1, dd.p_2,
+                dd.Ap_0, dd.Ap_1, dd.Ap_2,
+                &dd.d_reduce[0]);
+            CUDA_CHECK(cudaDeviceSynchronize());
         }
-        kernel_dot3_reduce<<<grid_owned, BLOCK_SIZE>>>(
-            0, num_owned,
-            dd.p_0, dd.p_1, dd.p_2,
-            dd.Ap_0, dd.Ap_1, dd.Ap_2,
-            &dd.d_reduce[0]);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        if (do_timing) t_spmv += MPI_Wtime() - _t0;
+        if (pt)
+            pt->spmv_bdr += MPI_Wtime() - _t0;
 
         CUDA_CHECK(cudaMemcpy(&h_pAp, dd.d_reduce, sizeof(double), cudaMemcpyDeviceToHost));
+        if (pt)
+        {
+            _t0 = MPI_Wtime();
+            MPI_Barrier(MPI_COMM_WORLD);
+            pt->barrier_pAp += MPI_Wtime() - _t0;
+        }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (do_timing) t_ar_pAp += MPI_Wtime() - _t0;
+        if (pt)
+            pt->allreduce_pAp += MPI_Wtime() - _t0;
 
         double alpha = rz / h_pAp;
 
-        // x += alpha * p
+        // x += alpha * p, r -= alpha * Ap, r_norm計算
+        _t0 = MPI_Wtime();
         kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
             num_nodes, alpha,
             dd.p_0, dd.p_1, dd.p_2,
             dd.u_tmp_0, dd.u_tmp_1, dd.u_tmp_2);
 
-        // r -= alpha * Ap, r_norm計算 + z = C^{-1}r, rz_new計算
-        // rnorm と rznew の AllReduce を1回に統合（収束前に rz_new も計算）
         CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 2 * sizeof(double)));
         kernel_update_r<<<grid_owned, BLOCK_SIZE>>>(
             num_owned, alpha,
             dd.Ap_0, dd.Ap_1, dd.Ap_2,
             dd.r_0, dd.r_1, dd.r_2,
-            &dd.d_reduce[0]);   // d_reduce[0] に r_norm を蓄積
+            &dd.d_reduce[0]);
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (pt)
+            pt->update_x_r += MPI_Wtime() - _t0;
 
+        // z = C^{-1}r, rz_new計算（収束前に実行し AllReduce を 1 回に統合）
+        _t0 = MPI_Wtime();
         kernel_precond_and_rz<<<grid_owned, BLOCK_SIZE>>>(
             num_owned,
             dd.inv_diag_00, dd.inv_diag_01, dd.inv_diag_02,
@@ -1510,14 +1547,24 @@ int pcg_solve(
             dd.inv_diag_20, dd.inv_diag_21, dd.inv_diag_22,
             dd.r_0, dd.r_1, dd.r_2,
             dd.z_0, dd.z_1, dd.z_2,
-            &dd.d_reduce[1]);   // d_reduce[1] に rz_new を蓄積
+            &dd.d_reduce[1]);
         CUDA_CHECK(cudaDeviceSynchronize());
+        if (pt)
+            pt->precond += MPI_Wtime() - _t0;
 
+        // r_norm と rz_new を 1 回の AllReduce で取得
         double h_rn_rz[2];
         CUDA_CHECK(cudaMemcpy(h_rn_rz, dd.d_reduce, 2 * sizeof(double), cudaMemcpyDeviceToHost));
+        if (pt)
+        {
+            _t0 = MPI_Wtime();
+            MPI_Barrier(MPI_COMM_WORLD);
+            pt->barrier_rnorm += MPI_Wtime() - _t0;
+        }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, h_rn_rz, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        if (do_timing) t_ar_rnorm += MPI_Wtime() - _t0;
+        if (pt)
+            pt->allreduce_rnorm += MPI_Wtime() - _t0;
         r_norm = h_rn_rz[0];
         double rz_new = h_rn_rz[1];
 
@@ -1536,22 +1583,6 @@ int pcg_solve(
 
         rz = rz_new;
     }
-    t_loop_total = MPI_Wtime() - loop_start;
-
-    if (do_timing)
-    {
-        double local[] = {t_halo, t_spmv, t_ar_pAp, t_ar_rnorm, t_loop_total};
-        double maxv[5] = {};
-        MPI_Reduce(local, maxv, 5, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-        if (rank == 0)
-        {
-            printf("  [timing %d iter] HaloWait=%.3fs SpMV=%.3fs "
-                   "AllReduce=%.3fs(pAp=%.3f rnorm+rznew=%.3f) total=%.3fs\n",
-                   iter, maxv[0], maxv[1],
-                   maxv[2] + maxv[3], maxv[2], maxv[3], maxv[4]);
-        }
-    }
-
     return iter;
 }
 
@@ -1669,9 +1700,13 @@ int main(int argc, char *argv[])
     int target_node = get_owned_local_id(mesh, cfg.get_int("target_node"));
     int force_node = get_owned_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
-    double force_magnitude = cfg.get_double("force_magnitude");
-    double disp_amp = cfg.get_double("disp_amp");
+    int bc_face_axis = cfg.get_int("bc_face_axis");
+    double bc_face_coord = cfg.get_double("bc_face_coord");
+    int bc_dof = cfg.get_int("bc_dof");
+    Waveform bc_wave = Waveform::from_config(cfg, "bc_");
+    Waveform force_wave = Waveform::from_config(cfg, "force_");
     bool write_vtk = cfg.get_bool("write_vtk");
+    bool do_timing = cfg.has("timing") && cfg.get_bool("timing");
     enum class MassVersion
     {
         CONSISTENT,
@@ -1709,7 +1744,7 @@ int main(int argc, char *argv[])
 
     // ローカルランク（ノード内での順位）でGPUを割り当てる
     // ntasks-per-node が num_gpus 以下の任意の値でも正しく動作する
-    const char* local_rank_env = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    const char *local_rank_env = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
     int local_rank = local_rank_env ? atoi(local_rank_env) : (rank % num_gpus);
     CUDA_CHECK(cudaSetDevice(local_rank % num_gpus));
 
@@ -1767,7 +1802,7 @@ int main(int argc, char *argv[])
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
-        if (node_coords[i * 3 + 2] < 1e-6)
+        if (node_coords[i * 3 + bc_face_axis] <= bc_face_coord + 1e-6)
         {
             bc_flag[i] = 1;
         }
@@ -1960,22 +1995,12 @@ int main(int argc, char *argv[])
         double step_start_time = MPI_Wtime();
 
         double t = step * dt;
-        bc_val_u[0] = 0.0;
-        bc_val_u[1] = disp_amp * sin(t);
-        bc_val_u[2] = 0.0;
-        bc_val_v[0] = 0.0;
-        bc_val_v[1] = disp_amp * cos(t);
-        bc_val_v[2] = 0.0;
-        bc_val_a[0] = 0.0;
-        bc_val_a[1] = -disp_amp * sin(t);
-        bc_val_a[2] = 0.0;
-        // sin波は1周期分のみ入力する。
-        if (t > 2 * M_PI)
-        {
-            bc_val_u[1] = 0.0;
-            bc_val_v[1] = 0.0;
-            bc_val_a[1] = 0.0;
-        }
+        bc_val_u[0] = bc_val_u[1] = bc_val_u[2] = 0.0;
+        bc_val_v[0] = bc_val_v[1] = bc_val_v[2] = 0.0;
+        bc_val_a[0] = bc_val_a[1] = bc_val_a[2] = 0.0;
+        bc_val_u[bc_dof] = bc_wave.eval(t);
+        bc_val_v[bc_dof] = bc_wave.eval_vel(t);
+        bc_val_a[bc_dof] = bc_wave.eval_acc(t);
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.bc_val_v, bc_val_v, 3 * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(dd.bc_val_a, bc_val_a, 3 * sizeof(double), cudaMemcpyHostToDevice));
@@ -2009,7 +2034,7 @@ int main(int argc, char *argv[])
                 d_rhs_target = &dd.rhs_2[force_node];
 
             CUDA_CHECK(cudaMemcpy(&h_rhs_val, d_rhs_target, sizeof(double), cudaMemcpyDeviceToHost));
-            h_rhs_val += force_magnitude;
+            h_rhs_val += force_wave.eval(t);
             CUDA_CHECK(cudaMemcpy(d_rhs_target, &h_rhs_val, sizeof(double), cudaMemcpyHostToDevice));
         }
 
@@ -2027,16 +2052,55 @@ int main(int argc, char *argv[])
 
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // PCGソルバー（step 2 のみ詳細タイミング出力）
-        bool print_timing = (step == 2);
+        // PCGソルバー（do_timing=true のときのみ詳細計測）
+        PcgTimings pcg_t;
         int iter = pcg_solve(dd, requests, num_neighbors, neighbor_ranks,
                              recv_starts, recv_counts, send_starts, send_counts,
                              num_inner, num_owned, num_nodes, 1e-8, num_nodes * 3,
-                             print_timing ? rank : -1);
+                             do_timing ? &pcg_t : nullptr);
 
         if (rank == 0)
         {
             std::cout << "Step " << step << ", PCG iterations: " << iter << std::endl;
+        }
+
+        if (do_timing)
+        {
+            const double allreduce_total_local =
+                pcg_t.allreduce_pAp + pcg_t.allreduce_rnorm + pcg_t.allreduce_rznew;
+            const double barrier_total_local =
+                pcg_t.barrier_pAp + pcg_t.barrier_rnorm + pcg_t.barrier_rznew;
+            double timing_local[] = {
+                pcg_t.pack_buf,
+                pcg_t.spmv_inner,
+                pcg_t.halo_wait,
+                pcg_t.spmv_bdr,
+                pcg_t.allreduce_pAp,
+                pcg_t.barrier_pAp,
+                pcg_t.update_x_r,
+                pcg_t.allreduce_rnorm,
+                pcg_t.barrier_rnorm,
+                pcg_t.precond,
+                pcg_t.allreduce_rznew,
+                pcg_t.barrier_rznew,
+                allreduce_total_local,
+                barrier_total_local};
+            double timing_max[14] = {};
+            MPI_Reduce(timing_local, timing_max, 14, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            if (rank == 0)
+            {
+                printf("  [timing rank-max] PCG内訳(%d反復): "
+                       "AllReduce合計=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) "
+                       "Barrier直前合計=%.3fs(pAp=%.3f rnorm=%.3f rznew=%.3f) "
+                       "HaloWait=%.3fs Pack=%.3fs SpMV(inner+bdr)=%.3fs(%.3f+%.3f) "
+                       "前処理=%.3fs GPU更新=%.3fs\n",
+                       iter,
+                       timing_max[12], timing_max[4], timing_max[7], timing_max[10],
+                       timing_max[13], timing_max[5], timing_max[8], timing_max[11],
+                       timing_max[2], timing_max[0],
+                       timing_max[1] + timing_max[3], timing_max[1], timing_max[3],
+                       timing_max[9], timing_max[6]);
+            }
         }
 
         // Newmark-β更新

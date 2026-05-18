@@ -28,6 +28,7 @@ python3 convert_gmsh_to_fistr.py
 import sys
 import os
 from math import sin
+from math import pi
 
 # ---------------------------------------------------------------------------
 # Material / amplitude parameters
@@ -35,9 +36,9 @@ from math import sin
 YOUNG = 160000000.0 / 3.0
 POISSON = 1.0 / 3.0
 DENSITY = 2000.0
-AMP_DT = 0.000625  # amplitude table time step [s]
-AMP_END = 40.0  # amplitude table end time [s]
-WAVE_AMP = 0.001
+AMP_DT = 0.01 / 512.0  # amplitude table time step [s]
+AMP_END = 100.0  # amplitude table end time [s]
+WAVE_AMP = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +225,8 @@ def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
         for i in range(n_steps + 1):
             t = i * AMP_DT
             wave = WAVE_AMP * sin(t)
+            if t > 2.0 * pi:
+                wave = 0.0
             f.write(f"{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n")
 
         f.write("!END\n")

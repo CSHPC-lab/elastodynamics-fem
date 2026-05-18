@@ -1,14 +1,16 @@
 /*実行コマンド
 cd /data3/kusumoto/elastodynamics-fem/
 module load nvhpc/25.1
-nvcc main_recursive_gl_strain.cu msh_reader.cpp -Xcompiler -fopenmp -ccbin mpicxx -arch=sm_80 -lineinfo
+nvcc -O2 -arch=sm_80 -Xcompiler -fopenmp -ccbin mpicxx main_recursive_gl_strain.cu msh_reader.cpp
+nsight computeのコードベース解析には-lineinfoオプションを使う
 sm_80はA100向け。H100、GH200ならsm_90。
 mpirun -np 4 ./a.out
-増分解析バージョン
+Green-Lagrangeひずみ + Newton-Raphson反復バージョン
 */
 
 #include "msh_reader.hpp"
 #include "config.hpp"
+#include "waveform.hpp"
 #include <iostream>
 #include <cmath>
 #include <ctime>
@@ -110,7 +112,8 @@ struct DeviceData
     double *send_buffer_0, *send_buffer_1, *send_buffer_2;
 
     // リダクション用
-    double *d_reduce; // 小さいバッファ（3要素程度）
+    double *d_reduce;                             // 小さいバッファ（3要素程度）
+    double *du_accum_0, *du_accum_1, *du_accum_2; // ΔU = Σδu（rxnrm 分母用）
 };
 
 // ============================================================
@@ -2334,8 +2337,11 @@ int main(int argc, char *argv[])
     int target_node = get_owned_local_id(mesh, cfg.get_int("target_node"));
     int force_node = get_owned_local_id(mesh, cfg.get_int("force_node"));
     int force_dof = cfg.get_int("force_dof");
-    double force_magnitude = cfg.get_double("force_magnitude");
-    double disp_amp = cfg.get_double("disp_amp");
+    int bc_face_axis = cfg.get_int("bc_face_axis");
+    double bc_face_coord = cfg.get_double("bc_face_coord");
+    int bc_dof = cfg.get_int("bc_dof");
+    Waveform bc_wave = Waveform::from_config(cfg, "bc_");
+    Waveform force_wave = Waveform::from_config(cfg, "force_");
     enum class MassVersion
     {
         CONSISTENT,
@@ -2352,6 +2358,12 @@ int main(int argc, char *argv[])
             mass_version = MassVersion::SECOND;
     }
     bool write_vtk = cfg.get_bool("write_vtk");
+    int max_newton_iter = cfg.get_int("newton_max_iter");
+    double newton_converg = cfg.get_double("newton_converg");
+    double newton_converg_ddisp = cfg.get_double("newton_converg_ddisp");
+    double newton_maxres = cfg.get_double("newton_maxres");
+    double pcg_tol = cfg.get_double("pcg_tol");
+    int pcg_max_iter = cfg.get_int("pcg_max_iter");
 
     printf("c1: %.2f m/s, c2: %.2f m/s\n, rho: %.2e kg/m^3\n", c1, c2, rho);
     if (rank == 0)
@@ -2437,7 +2449,7 @@ int main(int argc, char *argv[])
 #pragma omp parallel for
     for (int i = 0; i < num_nodes; i++)
     {
-        if (node_coords[i * 3 + 2] < 1e-6)
+        if (node_coords[i * 3 + bc_face_axis] <= bc_face_coord + 1e-6)
         {
             bc_flag[i] = 1;
         }
@@ -2633,6 +2645,9 @@ int main(int argc, char *argv[])
 
     // リダクション用
     dd.d_reduce = device_alloc_zero<double>(3);
+    dd.du_accum_0 = device_alloc_zero<double>(num_nodes);
+    dd.du_accum_1 = device_alloc_zero<double>(num_nodes);
+    dd.du_accum_2 = device_alloc_zero<double>(num_nodes);
 
     CUDA_CHECK(cudaDeviceSynchronize());
     double preprocessing_time = MPI_Wtime() - start_time;
@@ -2675,14 +2690,8 @@ int main(int argc, char *argv[])
         CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
 
         double t = step * dt;
-        bc_val_u[0] = 0.0;
-        bc_val_u[1] = disp_amp * sin(t) - disp_amp * sin(t - dt);
-        bc_val_u[2] = 0.0;
-        // sin波は1周期分のみ入力する。
-        if (t > 2 * M_PI)
-        {
-            bc_val_u[1] = 0.0;
-        }
+        bc_val_u[0] = bc_val_u[1] = bc_val_u[2] = 0.0;
+        bc_val_u[bc_dof] = bc_wave.eval(t) - bc_wave.eval(t - dt);
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β RHS構築
@@ -2698,7 +2707,13 @@ int main(int argc, char *argv[])
             dd.tmp_0, dd.tmp_1, dd.tmp_2,
             dd.rhs_original_0, dd.rhs_original_1, dd.rhs_original_2);
 
-        while (true)
+        // ── Newton-Raphson ループ（FrontISTR 互換収束判定）──
+        int newton_iter = 0;
+        double delta_u_norm_prev = 0.0;
+        CUDA_CHECK(cudaMemset(dd.du_accum_0, 0, num_nodes * sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.du_accum_1, 0, num_nodes * sizeof(double)));
+        CUDA_CHECK(cudaMemset(dd.du_accum_2, 0, num_nodes * sizeof(double)));
+        for (; newton_iter <= max_newton_iter; ++newton_iter)
         {
             CUDA_CHECK(cudaDeviceSynchronize());
             double inner_loop_start_time = MPI_Wtime();
@@ -2725,7 +2740,7 @@ int main(int argc, char *argv[])
                     d_rhs_target = &dd.rhs_2[force_node];
 
                 CUDA_CHECK(cudaMemcpy(&h_rhs_val, d_rhs_target, sizeof(double), cudaMemcpyDeviceToHost));
-                h_rhs_val += force_magnitude;
+                h_rhs_val += force_wave.eval(t);
                 CUDA_CHECK(cudaMemcpy(d_rhs_target, &h_rhs_val, sizeof(double), cudaMemcpyHostToDevice));
             }
 
@@ -2739,11 +2754,65 @@ int main(int argc, char *argv[])
 
             CUDA_CHECK(cudaDeviceSynchronize());
 
+            // ── FrontISTR 互換 Newton 収束判定（iter > 0 のとき実行）──
+            if (newton_iter > 0)
+            {
+                int grid_owned_c = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                CUDA_CHECK(cudaMemset(dd.d_reduce, 0, 3 * sizeof(double)));
+                // ||rhs||², ||f_int||², ||ΔU||² を 1 回の AllReduce で取得
+                kernel_dot3_reduce<<<grid_owned_c, BLOCK_SIZE>>>(
+                    0, num_owned, dd.rhs_0, dd.rhs_1, dd.rhs_2,
+                    dd.rhs_0, dd.rhs_1, dd.rhs_2, &dd.d_reduce[0]);
+                kernel_dot3_reduce<<<grid_owned_c, BLOCK_SIZE>>>(
+                    0, num_owned, dd.f_int_0, dd.f_int_1, dd.f_int_2,
+                    dd.f_int_0, dd.f_int_1, dd.f_int_2, &dd.d_reduce[1]);
+                kernel_dot3_reduce<<<grid_owned_c, BLOCK_SIZE>>>(
+                    0, num_owned, dd.du_accum_0, dd.du_accum_1, dd.du_accum_2,
+                    dd.du_accum_0, dd.du_accum_1, dd.du_accum_2, &dd.d_reduce[2]);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                double h_norms[3];
+                CUDA_CHECK(cudaMemcpy(h_norms, dd.d_reduce, 3 * sizeof(double), cudaMemcpyDeviceToHost));
+                MPI_Allreduce(MPI_IN_PLACE, h_norms, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+                double qnrm = std::sqrt(h_norms[1]);
+                if (qnrm < 1e-8)
+                    qnrm = 1.0; // 外力ゼロ時は絶対残差として扱う
+                double rres = std::sqrt(h_norms[0]) / qnrm;
+                double dunrm = std::sqrt(std::max(h_norms[2], 1e-64));
+                double rxnrm = std::sqrt(delta_u_norm_prev) / dunrm;
+
+                if (rank == 0)
+                    printf("  Newton iter %d: rres=%.4e (tol=%.4e), rxnrm=%.4e (tol=%.4e)\n",
+                           newton_iter, rres, newton_converg, rxnrm, newton_converg_ddisp);
+
+                if (rres > newton_maxres || std::isnan(rres))
+                {
+                    if (rank == 0)
+                        printf("### Newton diverged at step %d, iter %d (rres=%.4e)\n",
+                               step, newton_iter, rres);
+                    break;
+                }
+                if (rres < newton_converg || rxnrm < newton_converg_ddisp)
+                {
+                    if (rank == 0)
+                        printf("Newton converged at step %d, iter %d (rres=%.4e, rxnrm=%.4e)\n",
+                               step, newton_iter, rres, rxnrm);
+                    break;
+                }
+                if (newton_iter == max_newton_iter)
+                {
+                    if (rank == 0)
+                        printf("### Newton failed to converge at step %d (rres=%.4e, maxres=%.4e)\n",
+                               step, rres, newton_maxres);
+                    break;
+                }
+            }
+
             // PCGソルバー（do_timing=true のときのみ詳細計測）
             PcgTimings pcg_t;
             int iter = pcg_solve(dd, requests, num_neighbors, neighbor_ranks,
                                  recv_starts, recv_counts, send_starts, send_counts,
-                                 num_inner, num_owned, num_nodes, 1e-12, num_nodes * 3,
+                                 num_inner, num_owned, num_nodes, pcg_tol, pcg_max_iter,
                                  do_timing ? &pcg_t : nullptr);
 
             if (rank == 0)
@@ -2760,8 +2829,10 @@ int main(int argc, char *argv[])
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaMemcpy(&delta_u_norm, &dd.d_reduce[0], sizeof(double), cudaMemcpyDeviceToHost));
             MPI_Allreduce(MPI_IN_PLACE, &delta_u_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            delta_u_norm_prev = delta_u_norm;
             if (rank == 0)
                 std::cout << "Step " << step << ", delta_u norm: " << delta_u_norm << std::endl;
+            double _t_k_rebuild = do_timing ? MPI_Wtime() : 0.0;
 
             // 応力更新、座標更新、行列再構築が正しい隣接節点値を読むように同期する。
             exchange_nodal_vector(num_neighbors, neighbor_ranks,
@@ -2802,6 +2873,11 @@ int main(int argc, char *argv[])
                 dd.node_coords, num_nodes);
 
             // delta uのリセット
+            // du_accum += delta_u（ΔU の累積。リセット前に実行）
+            kernel_axpy<<<grid_nodes, BLOCK_SIZE>>>(
+                num_nodes, 1.0,
+                dd.delta_u_0, dd.delta_u_1, dd.delta_u_2,
+                dd.du_accum_0, dd.du_accum_1, dd.du_accum_2);
             CUDA_CHECK(cudaMemset(dd.delta_u_0, 0.0, num_nodes * sizeof(double)));
             CUDA_CHECK(cudaMemset(dd.delta_u_1, 0.0, num_nodes * sizeof(double)));
             CUDA_CHECK(cudaMemset(dd.delta_u_2, 0.0, num_nodes * sizeof(double)));
@@ -2879,6 +2955,8 @@ int main(int argc, char *argv[])
             // 接線行列と同じ owned+ghost 要素セットからローカルに組み立てる。
             // GL 版では stress が要素履歴変数なので、K と f_int で別 rank の
             // stress コピーを混ぜると残差と接線が整合しない。
+            if (do_timing) CUDA_CHECK(cudaDeviceSynchronize());
+            double t_k_rebuild_local = do_timing ? MPI_Wtime() - _t_k_rebuild : 0.0;
             double t_fint_local = 0.0;
             double _t_fint = do_timing ? MPI_Wtime() : 0.0;
             cudaMemset(dd.f_int_0, 0, num_nodes * sizeof(double));
@@ -2917,6 +2995,7 @@ int main(int argc, char *argv[])
                     pcg_t.barrier_rznew,
                     allreduce_total_local,
                     barrier_total_local,
+                    t_k_rebuild_local,
                     t_fint_local,
                     inner_loop_time};
                 double timing_max[sizeof(timing_local) / sizeof(timing_local[0])] = {};
@@ -2936,33 +3015,19 @@ int main(int argc, char *argv[])
                            timing_max[2], timing_max[0],
                            timing_max[1] + timing_max[3], timing_max[1], timing_max[3],
                            timing_max[9], timing_max[6]);
-                    printf("  [timing rank-max] PCG外: f_int_local=%.3fs 内側ループ合計=%.3fs\n",
-                           timing_max[14], timing_max[15]);
+                    printf("  [timing rank-max] PCG外: k_rebuild=%.3fs f_int=%.3fs 内側ループ合計=%.3fs\n",
+                           timing_max[14], timing_max[15], timing_max[16]);
                 }
             }
             if (rank == 0)
             {
                 std::cout << "Step " << step << " inner loop completed in " << inner_loop_time << " seconds." << std::endl;
             }
-
-            // delta uがゼロに近いなら収束とみなしてループを抜ける
-            if (std::sqrt(delta_u_norm) < 1e-8)
-            {
-                if (rank == 0)
-                    std::cout << "Converged" << std::endl;
-                break;
-            }
         }
 
-        // 改めて境界条件の値をセット（更新のため）
-        bc_val_u[0] = 0.0;
-        bc_val_u[1] = disp_amp * sin(t);
-        bc_val_u[2] = 0.0;
-        // sin波は1周期分のみ入力する。
-        if (t > 2 * M_PI)
-        {
-            bc_val_u[1] = 0.0;
-        }
+        // 改めて境界条件の値をセット（Newmark 更新用：絶対変位）
+        bc_val_u[0] = bc_val_u[1] = bc_val_u[2] = 0.0;
+        bc_val_u[bc_dof] = bc_wave.eval(t);
         CUDA_CHECK(cudaMemcpy(dd.bc_val_u, bc_val_u, 3 * sizeof(double), cudaMemcpyHostToDevice));
 
         // Newmark-β更新
