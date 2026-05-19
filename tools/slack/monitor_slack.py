@@ -8,6 +8,12 @@ import subprocess, json, urllib.request, os, sys, traceback, time
 from datetime import datetime
 from collections import defaultdict
 import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# スクリプトの場所から見てリポジトリルートの .env を絶対パスで指す
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(ENV_PATH)
 
 WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

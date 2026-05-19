@@ -50,18 +50,9 @@ tail -f /data3/kusumoto/elastodynamics-fem/cpp_log/monitor_slack.log
 
 ## スクリプト更新手順
 
-1. ローカルで `tools/slack/monitor_slack.py` を編集
-2. lynx へ転送（WSL から）:
-
-```bash
-KEY="-i /tmp/lynx_id_rsa"
-rsync -av -e "ssh $KEY" \
-  tools/slack/monitor_slack.py \
-  kusumoto@lynx.eri.u-tokyo.ac.jp:/data3/kusumoto/elastodynamics-fem/tools/slack/
-```
-
-3. 手動実行でテスト（上記参照）
-4. 問題なければ次のcron実行から自動的に新バージョンが使われる
+1. `tools/slack/monitor_slack.py` を編集
+2. 手動実行でテスト（上記参照）
+3. 問題なければ次のcron実行から自動的に新バージョンが使われる
 
 ## cron の再登録（サーバーメンテ後など）
 
