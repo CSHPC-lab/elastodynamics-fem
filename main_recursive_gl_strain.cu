@@ -1994,6 +1994,7 @@ int pcg_solve(
 {
     int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int rank; MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     // リダクション用のデバイスメモリ（3要素: rz, b_norm, r_norm）
     double h_vals[3] = {0.0, 0.0, 0.0};
@@ -2132,6 +2133,11 @@ int pcg_solve(
         }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (h_pAp <= 0.0) {
+            if (rank == 0)
+                printf("  [PCG WARNING] pAp=%.6e <= 0 at iter %d: K_eff is NOT positive definite\n", h_pAp, iter);
+            return -1;
+        }
         if (pt)
             pt->allreduce_pAp += MPI_Wtime() - _t0;
 
@@ -2709,6 +2715,7 @@ int main(int argc, char *argv[])
 
         // ── Newton-Raphson ループ（FrontISTR 互換収束判定）──
         int newton_iter = 0;
+        bool keff_not_pd = false;
         double delta_u_norm_prev = 0.0;
         CUDA_CHECK(cudaMemset(dd.du_accum_0, 0, num_nodes * sizeof(double)));
         CUDA_CHECK(cudaMemset(dd.du_accum_1, 0, num_nodes * sizeof(double)));
@@ -2814,6 +2821,14 @@ int main(int argc, char *argv[])
                                  recv_starts, recv_counts, send_starts, send_counts,
                                  num_inner, num_owned, num_nodes, pcg_tol, pcg_max_iter,
                                  do_timing ? &pcg_t : nullptr);
+            if (iter < 0)
+            {
+                if (rank == 0)
+                    printf("### K_eff is NOT positive definite at step %d, Newton iter %d. Terminating simulation.\n",
+                           step, newton_iter);
+                keff_not_pd = true;
+                break;
+            }
 
             if (rank == 0)
             {
@@ -3024,6 +3039,8 @@ int main(int argc, char *argv[])
                 std::cout << "Step " << step << " inner loop completed in " << inner_loop_time << " seconds." << std::endl;
             }
         }
+
+        if (keff_not_pd) break;
 
         // 改めて境界条件の値をセット（Newmark 更新用：絶対変位）
         bc_val_u[0] = bc_val_u[1] = bc_val_u[2] = 0.0;

@@ -1671,6 +1671,7 @@ int pcg_solve(
 {
     int grid_nodes = (num_nodes + BLOCK_SIZE - 1) / BLOCK_SIZE;
     int grid_owned = (num_owned + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int rank; MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     // リダクション用のデバイスメモリ（3要素: rz, b_norm, r_norm）
     double h_vals[3] = {0.0, 0.0, 0.0};
@@ -1810,6 +1811,11 @@ int pcg_solve(
         }
         _t0 = MPI_Wtime();
         MPI_Allreduce(MPI_IN_PLACE, &h_pAp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        if (h_pAp <= 0.0) {
+            if (rank == 0)
+                printf("  [PCG WARNING] pAp=%.6e <= 0 at iter %d: K_eff is NOT positive definite\n", h_pAp, iter);
+            return -1;
+        }
         if (pt)
             pt->allreduce_pAp += MPI_Wtime() - _t0;
 
@@ -2328,6 +2334,12 @@ int main(int argc, char *argv[])
                              recv_starts, recv_counts, send_starts, send_counts,
                              num_inner, num_owned, num_nodes, 1e-12, num_nodes * 3,
                              do_timing ? &pcg_t : nullptr);
+        if (iter < 0)
+        {
+            if (rank == 0)
+                printf("### K_eff is NOT positive definite at step %d. Terminating simulation.\n", step);
+            break;
+        }
 
         if (rank == 0)
         {
