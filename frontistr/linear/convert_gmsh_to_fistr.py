@@ -7,38 +7,33 @@ Gmsh element types used:
    9 : tri6  (6-node 2nd-order triangle) -- surface faces
   11 : tet10 (10-node 2nd-order tetrahedron) -- volume
 
-Geometric tags for surface faces:
-  1 : x=0  face  -> FIX group (fixed end)
-  2 : x=10 face  -> free end  (CL1 = node at centroid)
-  3 : y=0  face
-  4 : y=1  face
-  5 : z=0  face
-  6 : z=1  face
+Geometric tags for surface faces (addBox(0,0,0, 10,10,100)):
+  1 : x=0   face
+  2 : x=10  face
+  3 : y=0   face
+  4 : y=10  face
+  5 : z=0   face  -> FIX group (fixed end)
+  6 : z=100 face  -> FORCE_NODE (top center, node at centroid)
 
 Node ordering for tet10:
-  Gmsh type 11 and FrontISTR type 342 share the same 10-node ordering:
-    corners  : n0, n1, n2, n3
-    midpoints: n4=mid(n0,n1), n5=mid(n1,n2), n6=mid(n0,n2),
-               n7=mid(n0,n3), n8=mid(n1,n3), n9=mid(n2,n3)
-  Therefore no reordering is needed when copying element connectivity.
+  Gmsh type 11 and FrontISTR type 342 share the same 10-node ordering,
+  except for midpoints n4/n5/n6 and n8/n9 which differ.
 
 python3 convert_gmsh_to_fistr.py
 """
 
 import sys
 import os
-from math import sin
-from math import pi
 
 # ---------------------------------------------------------------------------
-# Material / amplitude parameters
+# Material / load parameters — config.txt と一致させる
 # ---------------------------------------------------------------------------
-YOUNG = 160000000.0 / 3.0
-POISSON = 1.0 / 3.0
-DENSITY = 2000.0
-AMP_DT = 0.01 / 512.0  # amplitude table time step [s]
-AMP_END = 100.0  # amplitude table end time [s]
-WAVE_AMP = 0.5
+YOUNG = 160000000.0 / 3.0  # E [Pa]  (c1=200, c2=100, rho=2000 より)
+POISSON = 1.0 / 3.0  # ν
+DENSITY = 2000.0  # rho [kg/m^3]
+DURATION = 1000.0  # シミュレーション総時間 [s]  (config.txt: duration)
+FORCE_START = -10800000.0  # 点荷重の開始値 [N]          (config.txt: force_start)
+FORCE_END = -11200000.0  # 点荷重の終端値 [N]          (config.txt: force_end)
 
 
 # ---------------------------------------------------------------------------
@@ -136,32 +131,6 @@ def face_nodes(tri6_list):
     return sorted({n for _, nids in tri6_list for n in nids})
 
 
-def find_centroid_node(nodes, tri6_list):
-    """Return the node ID closest to the centroid of the face.
-
-    The centroid of the free-end face (x=10, y in [0,1], z in [0,1])
-    is (10, 0.5, 0.5).  Node 1 in column.msh is placed exactly there,
-    but we find it dynamically so the script stays general.
-    """
-    face_nids = face_nodes(tri6_list)
-    xs = [nodes[n][0] for n in face_nids]
-    ys = [nodes[n][1] for n in face_nids]
-    zs = [nodes[n][2] for n in face_nids]
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
-    cz = sum(zs) / len(zs)
-
-    best_nid = None
-    best_dist = float("inf")
-    for nid in face_nids:
-        x, y, z = nodes[nid]
-        d = (x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2
-        if d < best_dist:
-            best_dist = d
-            best_nid = nid
-    return best_nid
-
-
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------
@@ -172,12 +141,7 @@ def fmt_node_coord(v):
     return f"{v:.8e}"
 
 
-def fmt_amp_time(t):
-    """Format amplitude time as 5-digit scientific notation (e.g. 1.00000E-05)."""
-    return f"{t:.5E}"
-
-
-def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
+def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, force_node):
     with open(output_file, "w") as f:
 
         # --- header ---
@@ -194,8 +158,6 @@ def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
             )
 
         # --- volume elements ---
-        # Gmsh tet10 (type 11) and FrontISTR tet10 (type 342) share the same
-        # node ordering, so the connectivity is copied verbatim.
         f.write("!ELEMENT, TYPE=342, EGRP=column_0\n")
         for eid, nids in tet10_elems:
             f.write(f"{eid}," + ",".join(str(n) for n in nids) + "\n")
@@ -210,24 +172,19 @@ def write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node):
         # --- section ---
         f.write("!SECTION, TYPE=SOLID, EGRP=column_0, MATERIAL=M1\n")
 
-        # --- FIX node group (x=0 face: all nodes from geom_tag=1 triangles) ---
+        # --- FIX node group (z=0 face: geom_tag=5) ---
         f.write("!NGROUP, NGRP=FIX\n")
         for nid in fix_nodes:
             f.write(f"{nid},\n")
 
-        # # --- CL1 node group (centroid of free-end face) ---
-        # f.write('!NGROUP, NGRP=CL1\n')
-        # f.write(f'{cl1_node},\n')
+        # --- FORCE_NODE group (z=100 top face centroid: geom_tag=6) ---
+        f.write("!NGROUP, NGRP=FORCE_NODE\n")
+        f.write(f"{force_node},\n")
 
-        # --- amplitude (sin(t) load) ---
+        # --- amplitude: FORCE_START -> FORCE_END over 0 -> DURATION [s] ---
         f.write("!AMPLITUDE, NAME=AMP1\n")
-        n_steps = round(AMP_END / AMP_DT)
-        for i in range(n_steps + 1):
-            t = i * AMP_DT
-            wave = WAVE_AMP * sin(t)
-            if t > 2.0 * pi:
-                wave = 0.0
-            f.write(f"{fmt_amp_time(wave)}\t,\t{fmt_amp_time(t)}\n")
+        f.write(f"{FORCE_START:.5E}\t,\t0.00000E+00\n")
+        f.write(f"{FORCE_END:.5E}\t,\t{DURATION:.5E}\n")
 
         f.write("!END\n")
 
@@ -255,21 +212,19 @@ def main():
         f"  tri6 by geom   : { {k: len(v) for k, v in sorted(tri6_by_geomtag.items())} }"
     )
 
-    # --- FIX group: all nodes on z=0 face (geom_tag = 5) ---
+    # --- FIX group: all nodes on z=0 face (geom_tag=5) ---
     if 5 not in tri6_by_geomtag:
         sys.exit("ERROR: no tri6 elements with geom_tag=5 found (expected z=0 face)")
     fix_nodes = face_nodes(tri6_by_geomtag[5])
-    print(f"  FIX group      : {len(fix_nodes)} nodes (geom_tag=5)")
+    print(f"  FIX group      : {len(fix_nodes)} nodes (geom_tag=5, z=0)")
 
-    # --- CL1: centroid node of x=10 face (geom_tag = 2) ---
-    if 2 not in tri6_by_geomtag:
-        sys.exit("ERROR: no tri6 elements with geom_tag=2 found (expected x=10 face)")
-    cl1_node = find_centroid_node(nodes, tri6_by_geomtag[2])
-    cx, cy, cz = nodes[cl1_node]
-    print(f"  CL1 node       : {cl1_node}  ({cx}, {cy}, {cz})")
+    # --- FORCE_NODE: config.txt の force_node に合わせて固定 ---
+    force_node = 2
+    fx, fy, fz = nodes[force_node]
+    print(f"  FORCE_NODE     : {force_node}  ({fx}, {fy}, {fz})")
 
     print(f"Writing  : {output_file}")
-    write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, cl1_node)
+    write_fistr_msh(output_file, nodes, tet10_elems, fix_nodes, force_node)
     print("Done.")
 
 
