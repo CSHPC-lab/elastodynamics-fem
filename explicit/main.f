@@ -1,3 +1,7 @@
+! gfortran -O2 -ffixed-line-length-none -mcmodel=medium -c keme.f
+! gfortran -O2 -ffixed-line-length-none -mcmodel=medium -c pointsource.f
+! gfortran -O2 -ffixed-line-length-none -mcmodel=medium main.f keme.o pointsource.o /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3
+
       ! parameter(nex=301,ney=301,nez=150,kd=2,nt=10000)
       ! parameter(nex=201,ney=201,nez=100,kd=2,nt=10000)
       ! parameter(nex=721,ney=721,nez=350,kd=1,nt=100000,nobs=3)

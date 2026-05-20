@@ -7,3 +7,6 @@
 *.stats
 *.dat
 .env
+*.o
+*.ncu-rep
+*.png

@@ -10,6 +10,8 @@
 #SBATCH -o ./cpp_log/slurm.%j.out
 #SBATCH -e ./cpp_log/slurm.%j.err
 
+echo "Job started at $(date)"
+
 . /etc/profile.d/modules.sh
 module load nvhpc/25.1
 

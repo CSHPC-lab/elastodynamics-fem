@@ -1,17 +1,27 @@
 #!/bin/bash -l
 
-#SBATCH --nodes=1
-#SBATCH --partition=40g
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=48
+#SBATCH --nodes=2
+#SBATCH --partition=all
+#SBATCH --ntasks-per-node=4
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=12
+#SBATCH --gpus-per-task=1
 #SBATCH --time=120:00:00
 #SBATCH -o ../cpp_log/slurm.%j.out
 #SBATCH -e ../cpp_log/slurm.%j.err
 
-cd /data3/kusumoto/elastodynamics-fem/explicit
+echo "Job started at $(date)"
 
-# gfortran -O2 -ffixed-line-length-none -mcmodel=medium main.f keme.f pointsource.f /usr/lib/x86_64-linux-gnu/lapack/liblapack.so.3
+. /etc/profile.d/modules.sh
+module load nvhpc/25.1
 
-./a.out
+export OMP_NUM_THREADS=6
+
+# ノードあたりタスク数を自動計算（1〜4 どれでも動く）
+NPERNODE=$((SLURM_NTASKS / SLURM_JOB_NUM_NODES))
+
+mpirun -n ${SLURM_NTASKS} -npernode ${NPERNODE} \
+    --map-by numa --bind-to numa \
+    ./a.out
 
 echo "Job finished at $(date)"

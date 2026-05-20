@@ -7,6 +7,8 @@
 #PBS -o job_out.log
 #PBS -e job_err.log
 
+echo "Job started at $(date)"
+
 module unload nvidia
 module load nvidia/25.11
 
