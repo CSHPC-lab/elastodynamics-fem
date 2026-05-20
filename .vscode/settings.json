@@ -1,0 +1,10 @@
+{
+    "[fortran]": {
+        "editor.defaultFormatter": "fortran-lang.linter-gfortran",
+        "editor.formatOnSave": true
+    },
+    "[FortranFreeForm]": {
+        "editor.defaultFormatter": "fortran-lang.linter-gfortran",
+        "editor.formatOnSave": true
+    }
+}
